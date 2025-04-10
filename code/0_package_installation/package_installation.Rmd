@@ -1,0 +1,43 @@
+---
+title: "Social determinants predict frailty"
+author: "Yan Luo"
+date: '2025-04-10'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# CRAN packages
+
+```{r}
+
+# xx_data_analyzing.Rmd
+install.packages("tidyverse")
+install.packages("skimr")
+install.packages("haven")
+install.packages("sjlabelled")
+install.packages("VIM")
+install.packages("missRanger")
+install.packages("gtsummary")
+install.packages("boot")
+install.packages("shapviz")
+install.packages("tidymodels")
+install.packages("doParallel")
+install.packages("tictoc")
+
+# visualization
+install.packages("reshape2")
+install.packages("scales")
+install.packages("ggplot2")
+install.packages("patchwork")
+install.packages("ggpubr")
+install.packages("viridisLite")
+install.packages("utile.visuals")
+install.packages("ggrepel")
+install.packages("ggtext")
+install.packages("gridExtra")
+
+```

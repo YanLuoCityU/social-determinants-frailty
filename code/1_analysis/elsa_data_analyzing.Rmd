@@ -1,0 +1,5147 @@
+---
+title: "Social determinants predict frailty_ELSA"
+author: "Yan Luo"
+date: '2025-04-10'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Make sure the working directory is "your path/social-determinants-frailty"
+knitr::opts_knit$set(root.dir = "D:/github_project/social-determinants-frailty")
+
+# Data manipulation and visualization
+library(tidyverse)
+library(skimr)
+
+# Data import and label handling
+library(haven)
+library(sjlabelled)
+
+# Missing value handling and analysis
+library(VIM)
+library(missRanger)
+
+# Statistical analysis and reporting
+library(gtsummary)
+library(boot)
+library(shapviz)
+
+# Machine learning modeling
+library(tidymodels)
+
+# Parallel computing and performance
+library(doParallel)
+library(tictoc)
+
+```
+
+# Self-defined functions
+
+```{r}
+
+# Convert values to a factor with levels "yes" and "no", and set "no" as the reference level
+fac_relevel <- function(x){
+  y <- factor(x, labels = c("yes", "no"))
+  z <- relevel(y, ref = "no")
+  return(z)
+}
+
+# Convert values to a factor with levels "no" and "yes", and set "no" as the reference level
+fac_relevel3 <- function(x){
+  y <- factor(x, labels = c("no", "yes"))
+  z <- relevel(y, ref = "no")
+  return(z)
+}
+
+# Replace values equal to 10 with NA
+relevel2 <- function(x){
+  y <- ifelse(x == 10, NA, x)
+  return(y)
+}
+
+# Reverse code a scale by subtracting values from the maximum value plus 1
+reverse_code <- function(x) {
+  max_val <- max(x, na.rm = T)
+  return(max_val - x + 1)
+}
+
+# Count the number of NA values in a row
+count_na_row <- function(x) sum(is.na(x)) 
+
+# Calculate Mean Absolute Error (MAE) for a model using bootstrap resampling
+mae_func <- function(model, data, indices){
+  data_pred <- data[indices,] %>%
+    mutate(
+      pred = as.numeric(predict(model, new_data = ., type = "raw"))
+      )
+  return(data_pred %>%
+    yardstick::metrics(fi, pred) %>%
+    filter(.metric == "mae") %>%
+    pull(.estimate))
+}
+
+# Calculate R-squared for a model using bootstrap resampling
+rsq_func <- function(model, data, indices){
+  data_pred <- data[indices,] %>%
+    mutate(
+      pred = as.numeric(predict(model, new_data = ., type = "raw"))
+      )
+  return(data_pred %>%
+    yardstick::metrics(fi, pred) %>%
+    filter(.metric == "rsq") %>%
+    pull(.estimate))
+}
+
+# Calculate Root Mean Squared Error (RMSE) for a model using bootstrap resampling
+rmse_func <- function(model, data, indices){
+  data_pred <- data[indices,] %>%
+    mutate(
+      pred = as.numeric(predict(model, new_data = ., type = "raw"))
+      )
+  return(data_pred %>%
+    yardstick::metrics(fi, pred) %>%
+    filter(.metric == "rmse") %>%
+    pull(.estimate))
+}
+
+# Create a tidymodels workflow by combining a model and recipe
+create_workflow <- function(model, recipe) {
+  workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(model)
+}
+
+# Tune a model using grid search with parallel processing
+tune_model <- function(workflow, resamples, grid, metrics) {
+  n_cores <- detectCores()
+  doParallel::registerDoParallel(n_cores/2)
+  
+  grid_ctrl <- control_grid(
+    verbose = TRUE,
+    save_pred = FALSE,
+    parallel_over = NULL,
+    save_workflow = FALSE
+  )
+  
+  tic()
+  tuned_results <- tune_grid(
+    object = workflow,
+    resamples = resamples,
+    grid = grid,
+    metrics = metrics,
+    control = grid_ctrl
+  )
+  toc()
+  
+  return(tuned_results)
+}
+
+# Evaluate model performance on new data with special handling for ranger models
+evaluate_model <- function(model, new_data) {
+  # Special handling for ranger random forest model
+  if (class(final_rf_mod$fit$fit)[1] == "_ranger") {
+    pred <- predict(model, new_data = new_data)$.pred
+  } else {
+    pred <- predict(model, new_data = new_data, type = "raw") %>% as.vector()
+  }
+  
+  new_data %>%
+    mutate(
+      pred = pred
+    ) %>%
+    yardstick::metrics(fi, pred) %>%
+    mutate(.estimate = format(round(.estimate, 4), big.mark = ","))
+}
+
+# Analyze cross-validation performance for a tuned model
+analyze_cv_performance <- function(tuned_model, best_params) {
+  best_param_names <- names(best_params)[names(best_params) != ".config"]
+  
+  filter_conditions <- lapply(best_param_names, function(param) {
+    quo(!!sym(param) == best_params[[!!param]])
+  })
+  
+  cv_metrics <- tuned_model %>%
+    collect_metrics(summarize = FALSE) %>%
+    filter(!!!filter_conditions)
+  
+  cv_metrics %>%
+    group_by(.metric) %>%
+    summarise(
+      mean = mean(.estimate, na.rm = TRUE),
+      sd = sd(.estimate, na.rm = TRUE),
+      median = median(.estimate, na.rm = TRUE)
+    ) %>%
+    mutate(across(where(is.numeric), ~round(., 4)))
+}
+
+# Compare performance metrics across multiple machine learning models
+analyze_all_models <- function(
+  svm_tuned, svm_best_params,
+  xgb_tuned, xgb_best_params,
+  rf_tuned, rf_best_params,
+  lasso_tuned, lasso_best_params,
+  elastic_tuned, elastic_best_params
+) {
+  model_performances <- list(
+    SVM = analyze_cv_performance(svm_tuned, svm_best_params),
+    XGBoost = analyze_cv_performance(xgb_tuned, xgb_best_params),
+    RandomForest = analyze_cv_performance(rf_tuned, rf_best_params),
+    Lasso = analyze_cv_performance(lasso_tuned, lasso_best_params),
+    ElasticNet = analyze_cv_performance(elastic_tuned, elastic_best_params)
+  )
+  
+  bind_rows(model_performances, .id = "Model")
+}
+
+# Perform an environmental wide association study by testing each variable's association with a dependent variable
+environmental_wide_association_study <- function(data, dependent_var = "fi", control_vars = c("age", "male")) {
+
+  all_vars <- names(data)
+  excluded_vars <- c(dependent_var, control_vars)
+  predictor_vars <- setdiff(all_vars, excluded_vars)
+  
+  results <- data.frame()
+  
+  for (var in predictor_vars) {
+    formula_str <- paste(dependent_var, "~", paste(c(control_vars, var), collapse = " + "))
+    model_formula <- as.formula(formula_str)
+    
+    model <- lm(model_formula, data = data)
+    
+    model_summary <- tidy(model)
+    
+    var_summary <- model_summary[!model_summary$term %in% c("(Intercept)", "age", "malemale"), ] %>%
+      mutate(var = var)
+    
+    results <- rbind(results, var_summary)
+  }
+  
+  results <- results %>%
+    dplyr::select(var, term, estimate, std.error, p.value) %>%
+    arrange(term, p.value)
+  
+  return(results)
+}
+
+```
+
+
+# Data preprocessing
+
+## Long format Harmonized_ELSA (without define variables) 
+
+```{r}
+
+print(getwd())
+
+# Import the data
+harm_elsa <- read_tsv(str_c(getwd(), "/data/raw/elsa/h_elsa_g2.tab", sep = ""), col_types = cols(.default = "d"))
+
+wide_harm_elsa <- harm_elsa %>%
+  as_tibble() %>%
+  dplyr::select(
+    #### Demographics 
+    c(idauniq, idauniqc, pn, pnc, # id
+      ragender, raracem, raeduc_e, raedyrs_e, raeducl, # Gender Education
+      rabyear, radyear, # Birth/Death age in years 
+      ramischlth, rapabused, rapadrug, rasepmom, rapadivch, ranadisch, racombatch, # Childhood traumas
+      raattackch, ralifethch, rasfnhch, ralivdiffch,
+      ranadise, racombate, raattacke, ralifethe, rasfnhe, # Adulthood traumas
+      raccrooms, raccnpeople, raccbooks, raccbath, # Childhood socioeconomic
+      raccwaterc, raccwaterh, racctoilet, raccheating, raccnofeat,
+      ramomeduage, radadeduage, ramaoccup
+    ) | 
+      (starts_with("r") & (ends_with("iwindy") | ends_with("iwindm"))) | # Interview dates
+      (starts_with("r") & ends_with("agey") & !contains("f")) | # Age
+    #### Wealth & Income
+      (starts_with("h") & (ends_with("atotb") | ends_with("atotf") | ends_with("atoth") | ends_with("ahous") | ends_with("itot") | ends_with("ahown"))) |
+      (starts_with("r") & (ends_with("lbrf_e"))) | 
+    #### Healthcare
+      (starts_with("r") & (ends_with("hipriv"))) | # Private health insurance
+      (starts_with("r") & (ends_with("rcaremt_e"))) | # How Often Care Received Meets Needs
+    #### Health behaviours
+      (starts_with("r") & (ends_with("smokev") | ends_with("smoken") | ends_with("smokef") | ends_with("drink") | ends_with("drinkd_e") | ends_with("drinkwn_e") | ends_with("vgactx_e") | ends_with("mdactx_e") | ends_with("ltactx_e"))) |
+    #### Social Connections
+      (starts_with("r") & (ends_with("mstat"))) | # Marital status
+      (starts_with("r") & (ends_with("complac") | ends_with("leftout") | ends_with("isolate") | ends_with("lnlys3") | ends_with("lnlys3m"))) | # Loneliness
+      (starts_with("h") & (ends_with("hhres"))) | # Live alone (derived from Number of people in Household)
+      (starts_with("r") & (ends_with("socyr"))) | # Social activities
+      (starts_with("r") & (ends_with("kcnt") | ends_with("rcnt") | ends_with("fcnt") | ends_with("rfcnt"))) | # Weekly contact with other people
+      (starts_with("r") & (ends_with("livpar") | ends_with("momliv") | ends_with("dadliv") | ends_with("livsib") | ends_with("child"))) |
+      (starts_with("r") & (ends_with("momage") | ends_with("dadage"))) | # Parental Mortality
+      (starts_with("r") & (ends_with("sustdfe") | ends_with("srely") | ends_with("sopenup") | ends_with("sdemand") | ends_with("scritze") | ends_with("sletdow") | ends_with("sgetnev") | ends_with("kustdfe") | ends_with("krely") | ends_with("kopenup") | ends_with("kdemand") | ends_with("kcritze") | ends_with("kletdow") | ends_with("kgetnev") | ends_with("oustdfe") | ends_with("orely") | ends_with("oopenup") | ends_with("odemand") | ends_with("ocritze") | ends_with("oletdow") | ends_with("ogetnev") | ends_with("fustdfe") | ends_with("frely") | ends_with("fopenup") | ends_with("fdemand") | ends_with("fcritze") | ends_with("fletdow") | ends_with("fgetnev"))) | # Social support
+      (starts_with("r") & (ends_with("lsrspct") | ends_with("prsrvc") | ends_with("notsmrt") | ends_with("harass") | ends_with("prtrmt") | ends_with("dscrim5"))) | # Everyday Discrimination
+      (starts_with("r") & (ends_with("belong") | ends_with("vandal") | ends_with("trust") | ends_with("afwalk") | ends_with("unfriend") | ends_with("rubbish") | ends_with("hlpntr") | ends_with("alone") | ends_with("tadvan"))) | # Neighborhood Physical Disorder/Neighborhood Social Cohesion
+    #### Chronic Diseases
+      (starts_with("r") & (ends_with("hibpe") | ends_with("diabe") | ends_with("cancre") | ends_with("lunge") | ends_with("asthmae") | ends_with("hearte") | ends_with("angine") | ends_with("hrtatte") | ends_with("conhrtfe") | ends_with("hrtrhme") | ends_with("stroke") | ends_with("psyche") | ends_with("arthre") | ends_with("osteoe") | ends_with("parkine"))) | # Chronic Medical Conditions
+      (starts_with("r") & (ends_with("memrye") | ends_with("alzhe") | ends_with("demene"))) | # Memory-related diseases, Alzheimer’s disease, dementia
+    #### Functions
+      (starts_with("r") & (ends_with("batha") | ends_with("eata") | ends_with("beda") | ends_with("toilta") | ends_with("walkra") | ends_with("dressa") | ends_with("adltot_e") | ends_with("adltotm_e"))) | # ADL
+      (starts_with("r") & (ends_with("mapa") | ends_with("phonea") | ends_with("moneya") | ends_with("medsa") | ends_with("shopa") | ends_with("mealsa") | ends_with("housewka") | ends_with("iadltot1_e") | ends_with("iadltot1m_e"))) | # IADL
+      (starts_with("r") & (ends_with("walk100a") | ends_with("sita") | ends_with("chaira") | ends_with("climsa") | ends_with("clim1a") | ends_with("stoopa") | ends_with("lifta") | ends_with("dimea") | ends_with("armsa") | ends_with("pusha") | ends_with("mobilsev") | ends_with("mobilsevm"))) | # Other functional limitations
+      (starts_with("r") & (ends_with("imrc") | ends_with("dlrc") | ends_with("tr20") | ends_with("mo") | ends_with("dy") | ends_with("yr") | ends_with("dw") | ends_with("orient") | ends_with("verbf"))) | # Cognition
+      (starts_with("r") & (ends_with("depres") | ends_with("effort") | ends_with("sleepr") | ends_with("whappy") | ends_with("flone") | ends_with("fsad") | ends_with("going") | ends_with("enlife") | ends_with("cesd") | ends_with("cesdm"))) | # CES-D
+    #### Self-reported Health
+      (starts_with("r") & ends_with("shlt")) | # Self-report of health
+      (starts_with("r") & ends_with("sight")) | # Vision (including distance/near eyesight)
+      (starts_with("r") & ends_with("hearing")) | # Hearing 
+      (starts_with("r") & ends_with("fall")) | # Fall
+      (starts_with("r") & ends_with("hipe")) | # Fractured hip
+      (starts_with("r") & ends_with("painfr")) | # Pain
+      (starts_with("r") & ends_with("urinai")) |# Urinary Incontinence
+      (starts_with("r") & (ends_with("mheight") | ends_with("mweight") | ends_with("mbmi") | ends_with("mbmicat"))) # physical measures
+     ) %>% 
+  mutate(
+    .keep = "unused",
+    r1drinkd_e = NA, r1drinkwn_e = NA, r2drinkwn_e = NA, r3drinkwn_e = NA, # Drinking
+    r1complac = NA, r1leftout = NA, r1isolate = NA, r1lnlys3 = NA, r1lnlys3m = NA, # Loneliness
+    r1rfcnt = NA, r4rfcnt = NA, r1rcnt = NA, r4rcnt = NA,
+    r1sdemand = NA, r1kdemand = NA, r1odemand = NA, r1fdemand = NA, r2sdemand = NA, r2kdemand = NA, r2odemand = NA, r2fdemand = NA, r3sdemand = NA, r3kdemand = NA, r3odemand = NA, r3fdemand = NA, r4sdemand = NA, r4kdemand = NA, r4odemand = NA, r4fdemand = NA,
+    r1lsrspct = NA, r1prsrvc = NA, r1notsmrt = NA, r1harass = NA, r1prtrmt = NA, r1dscrim5 = NA, r2lsrspct = NA, r2prsrvc = NA, r2notsmrt = NA, r2harass = NA, r2prtrmt = NA, r2dscrim5 = NA, r3lsrspct = NA, r3prsrvc = NA, r3notsmrt = NA, r3harass = NA, r3prtrmt = NA, r3dscrim5 = NA, r4lsrspct = NA, r4prsrvc = NA, r4notsmrt = NA, r4harass = NA, r4prtrmt = NA, r4dscrim5 = NA, r6lsrspct = NA, r6prsrvc = NA, r6notsmrt = NA, r6harass = NA, r6prtrmt = NA, r6dscrim5 = NA, r7lsrspct = NA, r7prsrvc = NA, r7notsmrt = NA, r7harass = NA, r7prtrmt = NA, r7dscrim5 = NA, r8lsrspct = NA, r8prsrvc = NA, r8notsmrt = NA, r8harass = NA, r8prtrmt = NA, r8dscrim5 = NA, r9lsrspct = NA, r9prsrvc = NA, r9notsmrt = NA, r9harass = NA, r9prtrmt = NA, r9dscrim5 = NA, 
+    r2belong = NA, r2vandal = NA, r2trust = NA, r2afwalk = NA, r2unfriend = NA, r2rubbish = NA, r2hlpntr = NA, r2alone = NA, r2tadvan = NA, r4belong = NA, r4vandal = NA, r4trust = NA, r4afwalk = NA, r4unfriend = NA, r4rubbish = NA, r4hlpntr = NA, r4alone = NA, r4tadvan = NA, r5belong = NA, r5vandal = NA, r5trust = NA, r5afwalk = NA, r5unfriend = NA, r5rubbish = NA, r5hlpntr = NA, r5alone = NA, r5tadvan = NA, r6belong = NA, r6vandal = NA, r6trust = NA, r6afwalk = NA, r6unfriend = NA, r6rubbish = NA, r6hlpntr = NA, r6alone = NA, r6tadvan = NA, r8belong = NA, r8vandal = NA, r8trust = NA, r8afwalk = NA, r8unfriend = NA, r8rubbish = NA, r8hlpntr = NA, r8alone = NA, r8tadvan = NA, r9belong = NA, r9vandal = NA, r9trust = NA, r9afwalk = NA, r9unfriend = NA, r9rubbish = NA, r9hlpntr = NA, r9alone = NA, r9tadvan = NA,
+    r1rxdepres = NA, r3rxdepres = NA, r5rxdepres = NA, r6rxdepres = NA, r7rxdepres = NA, r9rxdepres = NA, r1trdepres = NA, r3trdepres = NA, r5trdepres = NA, r6trdepres = NA, r7trdepres = NA, r9trdepres = NA,
+    r3shlt = NA, r4fall = NA, r6verbf = NA,
+    r1mheight = NA, r1mweight = NA, r1mbmi = NA, r1mbmicat = NA, r3mheight = NA, r3mweight = NA, r3mbmi = NA, r3mbmicat = NA, r5mheight = NA, r5mweight = NA, r5mbmi = NA, r5mbmicat = NA, r7mheight = NA, r7mweight = NA, r7mbmi = NA, r7mbmicat = NA, r9mheight = NA, r9mbmi = NA, r9mbmicat = NA
+  ) 
+
+index_reorder <- str_detect(names(wide_harm_elsa), "[h-r][0-9]+(.*)")
+names_reorder <- names(wide_harm_elsa)[index_reorder] %>% 
+  str_match("[h-r]([0-9]+)(.*)") %>% 
+  as_tibble() %>% 
+  arrange(.[[3]], .[[2]]) %>%
+  dplyr::select(V1) %>%
+  as_vector("character") %>% unname()
+
+
+long_elsa <- wide_harm_elsa %>% 
+  dplyr::select(!contains(names_reorder), contains(names_reorder)) %>%
+    pivot_longer(
+    col = !c(idauniq, idauniqc, pn, pnc, # id
+      ragender, raracem, raeduc_e, raedyrs_e, raeducl, # Gender Education
+      rabyear, radyear, # Birth/Death age in years 
+      ramischlth, rapabused, rapadrug, rasepmom, rapadivch, ranadisch, racombatch, # Childhood traumas
+      raattackch, ralifethch, rasfnhch, ralivdiffch,
+      ranadise, racombate, raattacke, ralifethe, rasfnhe, # Adulthood traumas
+      raccrooms, raccnpeople, raccbooks, raccbath, # Childhood socioeconomic
+      raccwaterc, raccwaterh, racctoilet, raccheating, raccnofeat,
+      ramomeduage, radadeduage, ramaoccup),
+    names_to = ".value",
+    names_pattern = "[h-r][0-9]+(.*)"
+  ) %>%
+  mutate(
+      wave = case_when(
+      iwindy %in% c(2002:2003) ~ 2002,
+      iwindy %in% c(2004:2005) ~ 2004,
+      iwindy %in% c(2006:2007) ~ 2006,
+      iwindy %in% c(2008:2009) ~ 2008,
+      iwindy %in% c(2010:2011) ~ 2010,
+      iwindy %in% c(2012:2013) ~ 2012,
+      iwindy %in% c(2014:2015) ~ 2014,
+      iwindy %in% c(2016:2017) ~ 2016,
+      iwindy %in% c(2018:2019) ~ 2018
+    )
+  )
+
+rm(harm_elsa, wide_harm_elsa, index_reorder, names_reorder)
+
+```
+
+## Add variables from original raw data
+
+### 2008 (wave 4) - 2010 (wave 5) cohort core questionnaire
+
+```{r}
+
+# 2008 -------------------------------------------------------------------------
+elsa_w4 <- read_tsv(str_c(getwd(), "/data/raw/elsa/wave_4_elsa_data_v3.tab", sep = ""), col_types = cols(.default = "d")) %>%
+  rename_with(tolower) %>%
+  mutate(
+    .keep = "none",
+    idauniq, wave = 2008,
+    heslpa, heslpb, heslpd, heslpe, heslpf, # sleep 
+    scvega, scvegb, scvegc, scvegd, # vegatable
+    scfruia, scfruib, scfruic, scfruid, scfruie, scfruif, scfruig, scfruih, scfruii # fruit
+  )
+
+
+# 2010 -------------------------------------------------------------------------
+elsa_w5 <- read_tsv(str_c(getwd(), "/data/raw/elsa/wave_5_elsa_data_v4.tab", sep = ""), col_types = cols(.default = "d")) %>%
+  rename_with(tolower) %>%
+  mutate(
+    .keep = "none",
+    idauniq, wave = 2010,
+    difjob, difjobd, sclddr, 
+    hotenu, exrelefo, homeal, homoft, horoom, hocenh, hocenp, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, # home modifications
+    hoadpkm, hoadpli, hoadpcl, hoadpal, hoadp95, hoadp96,
+    hohavtv, hohavvr, hohavcd, hohavff, hohavwm, hohavwd, hohavdw, # household items
+    hohavmo, hohavpc, hohavdt, hohavph, hohavdv, hohav95, hohav96,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, hoprord, # housing problems
+    hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco, hopro95, hopro96,
+    scchdm, scfamm, scfrdm, # close relationships
+    scchd, scchdg, scchdh, scchdi, # social support
+    scfam, scfamg, scfamh, scfami,
+    scfrd, scfrdg, scfrdh, scfrdi,
+    scpt01, scpt02, scpt03, scpt04, scpt05, scpt06, scpt07, scpt08, # social participation
+    scorg01, scorg02, scorg03, scorg04, scorg05, scorg06, scorg07, scorg08, scorg09, scorgn,
+    erfvolmo, erfvolle, erfvolor, erfvolvi, erfvolbe, erfvoled, erfvolin, # volunteer
+    erfvolse, erfvoltr, erfvolre, erfvolca, erfvolpr, erfvoft, wpvw,
+    scacta, scactb, scactc, scactd, # cinema...
+    scedgp, scedch, scedde, scedop, scedho, # transport to General Practitioner...
+    sctvwkd, sctvwke, hopet, # TV, pet
+    scveg, scfru, scako, # fruit, vegetables
+    spcar, sptraa, sptrab1, sptrab2, sptrab3, sptrab4, sptrab5, sptrab6, sptrab7, sptrab8, # transportation
+    sptrab9, sptrab10, sptrab11, sptrab12, sptrab95,
+    hehpc, iaisali # life insurance
+  )
+
+long_original <- bind_rows(elsa_w4, elsa_w5)
+
+rm(elsa_w4, elsa_w5)
+
+```
+
+### 2006 life history
+
+```{r}
+
+
+elsa_lhms <- read_tsv(str_c(getwd(), "/data/raw/elsa/wave_3_life_history_data.tab", sep = ""), col_types = cols(.default = "d")) %>%
+  mutate(
+    .keep = "none",
+    idauniq, 
+    rcalv, rcalv2, rcalv3, rcalv4, rcalv5, rcalv6, rcalv7, 
+    rcalv8, rcalv9, rcalv10, rcalv11, rcalv12, rcalv13, 
+    rsmlet, rsmcold, rsmunder, rsmdicde, rsmnotwa, rsmdepen, rsmoverp, # maternal bonding - Mother (figure)
+    rsflet, rsfcold, rsfunder, rsfdecid, rsfnotwa, rsfdepen, rsfoverp, # paternal bonding - Father (figure)
+    radiv, rsdrink, rsargue, ramot, rsabuse, rsunemp, ramoy, 
+    ralis1, ralis2, ralis3, ralis4, ralis5, ralis6, ralis7, ralis8,
+    rsdisas, rsdisasy, rsill, rsilly, rsattac, rsattacy, rssexas, rssexasy, rsaddic, rsaddicy, 
+    rsfired, rsfiredy, rswitwr, rswitry, rswitkl, rswitkly, rsloswr, rsloswry, rsriskf, rsriskfy,
+    rscare, rscarey, rsfinan, rsfinany
+    ) 
+
+```
+
+## Variable definition + Exclusion
+
+```{r}
+
+long_merge <- long_elsa %>%
+  left_join(long_original, by = c("idauniq", "wave")) %>%
+  left_join(elsa_lhms, by = c("idauniq"))
+
+############### Exclusion ############### 
+# The number of participants aged >=50 years in 2010 (wave 5) is 10095
+id_50plus <- long_merge %>%
+  filter(wave == 2010 & agey >= 50) %>%
+  pull(idauniq)
+
+# The number of participants in 2010 and with 4-year follow-up is 7758
+id_4year <- long_merge %>%
+  filter(idauniq %in% id_50plus & wave == 2014) %>%
+  pull(idauniq)
+
+# The number of participants completing LHMS in 2006 is 7855
+id_lhms <- elsa_lhms$idauniq
+
+# The number of participants in 2006 (wave 3) is 9766
+id_2006 <- long_merge %>%
+  filter(wave == 2006) %>%
+  pull(idauniq)
+
+# The number of participants in 2008 (wave 4) is 11050
+id_2008 <- long_merge %>%
+  filter(wave == 2008) %>%
+  pull(idauniq)
+
+# The number of participants included is 6105
+id_include <- intersect(id_50plus, id_4year) # 7758
+id_include <- intersect(id_include, id_lhms) # 5071
+id_include <- intersect(id_include, id_2006) # 5058
+id_include <- intersect(id_include, id_2008) # 4925
+
+############### Neighborhood physical disorder + BMI + sleep ###############
+# Neighborhood physical disorder in 2006
+tidy_2006 <- long_merge %>%
+  filter(idauniq %in% id_include & wave == 2006) %>%
+  mutate_all(~ replace(., .< 0, NA_real_)) %>% # Replace negative values in all columns to NA
+  mutate(
+    .keep = "none",
+    idauniq, belong, trust, unfriend, hlpntr, rubbish, vandal, alone, afwalk, tadvan
+  )
+
+# BMI and sleep in 2008
+tidy_2008 <- long_merge %>%
+  filter(idauniq %in% id_include & wave == 2008) %>%
+  mutate_all(~ replace(., .< 0, NA_real_)) %>% # Replace negative values in all columns to NA
+  mutate(
+    .keep = "none",
+    idauniq, mbmi,
+    obesity = case_when(
+      mbmicat %in% c(4:6) ~ 1,
+      mbmicat %in% c(1:3) ~ 0,
+      TRUE ~ NA_real_
+      ),
+    sleeph = heslpe, fallslp = heslpa, wakent = heslpb, unrested = heslpd
+  )
+
+tidy_ses <- long_merge %>%
+  dplyr::select(idauniq, wave, atotb, itot)
+  
+############### Define variables ###############
+tidy_elsa <- long_merge %>%
+  filter(idauniq %in% id_include & wave == 2010) %>%
+  dplyr::select(!c(belong, trust, unfriend, hlpntr, rubbish, vandal, alone, afwalk, tadvan, atotb, itot, mbmi)) %>%
+  left_join(tidy_2006, by = "idauniq") %>%
+  left_join(tidy_2008, by = "idauniq") %>%
+  mutate_all(~ replace(., .< 0, NA_real_)) %>% # Replace negative values in all columns to NA
+  left_join(tidy_ses, by = c("idauniq", "wave")) %>%
+  mutate( # Defining variables
+    .keep = "none",
+    # Basic information---
+    id = idauniq, cohort = "elsa", country = 826, wave, 
+    iwy = iwindy, iwm = iwindm, 
+    
+    # Demographics---
+    age = agey, 
+    white = ifelse(raracem == 1, "white", "nonwhite"), white = relevel(factor(white), ref = "nonwhite"),
+    male = ifelse(ragender == 2, "female", "male"), male = relevel(factor(male), ref = "female"),
+    
+    # Childhood Adverse Experiences---
+    ramischlth, pabused = rapabused, sepmom = rasepmom, padrug = rapadrug, padivch = rapadivch, 
+    padiech = ifelse(radiv == 3, 1, 0), paargue = rsargue, orphanage = ralis1, fosterhome = ralis2, 
+    sexabusedch = case_when(
+      rssexas == 2 ~ 0,
+      rssexas == 1 & rssexasy > 16 ~ 0,
+      rssexas == 1 & rssexasy %in% c(0:16) ~ 1,
+      TRUE ~ NA_real_
+    ),
+    assaultch = case_when(
+      rsattac == 2 ~ 0,
+      rsattac == 1 & rsattacy > 16 ~ 0,
+      rsattac == 1 & rsattacy %in% c(0:16) ~ 1,
+      TRUE ~ NA_real_
+    ), raattackch,
+    rsmlet, rsmunder, rsmdicde, 
+    rsmcold, rsmnotwa, rsmdepen, rsmoverp, # reverse coded
+    rsflet, rsfunder, rsfdecid, 
+    rsfcold, rsfnotwa, rsfdepen, rsfoverp, # reverse coded
+    ramaoccup = case_when(
+      ramaoccup == 1 ~ "whitecollar",
+      ramaoccup == 2 ~ "bluecollar",
+      ramaoccup == 3 ~ "military",
+      ramaoccup == 4 ~ "other",
+      TRUE ~ NA_character_
+    ),
+    ramaoccup = relevel(factor(ramaoccup), ref = "whitecollar"),
+    difjob = case_when(
+      difjobd %in% c(2:5) ~ "high", 
+      difjobd %in% c(6:8) ~ "intermediate", 
+      difjobd %in% c(9:12,14,15) ~ "low", 
+      difjobd %in% c(1,13) ~ "other", 
+      TRUE ~ NA_character_
+    ),
+    difjob = relevel(factor(difjob), ref = "high"),
+    ramomedu = case_when(
+      ramomeduage %in% c(1,2) ~ 1, # Low
+      ramomeduage %in% c(3:5) ~ 2, # Intermediate 
+      ramomeduage %in% c(6,7) ~ 3, # High 
+      TRUE ~ NA_real_
+    ),
+    radadedu = case_when(
+      radadeduage %in% c(1,2) ~ 1, # low
+      radadeduage %in% c(3:5) ~ 2, # Intermediate 
+      radadeduage %in% c(6,7) ~ 3, # High 
+      TRUE ~ NA_real_
+    ),
+    rsunemp, sfnhch = rasfnhch, pproom = raccnpeople/raccrooms, raccbooks, 
+    raccbath, raccwaterc, raccwaterh, racctoilet, raccheating, raccnofeat,
+    
+    # Socioeconomic status---
+    raeducl, raeduc_e, atotb, itot,
+    lbrf = case_when(
+      lbrf_e %in% c(1, 2) ~ "employed",
+      lbrf_e %in% c(4, 5) ~ "retired",
+      lbrf_e %in% c(3, 6, 7) ~ "others",
+      TRUE ~ NA_character_
+    ), 
+    lbrf = relevel(factor(lbrf), ref = "employed"),
+    sclddr, # higher status
+    
+    # Material circumstances
+    homeal, exrelefo, 
+    hotenu, ownhome = ifelse(hotenu %in% c(1:3), 1, 0), ahown,
+    horoom, hocenh,
+    heat = case_when(
+      hocenh == 2 ~ "noheat",
+      hocenh == 1 & hocenp %in% c(1,2) ~ "clean",
+      hocenh == 1 & hocenp %in% c(3,5) ~ "notclean",
+      TRUE ~ NA_character_
+    ),
+    heat = relevel(factor(heat), ref = "clean"),
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, # home modifications
+    hoadpkm, hoadpli, hoadpcl, hoadpal, hoadp95, hoadp96,
+    hohavtv, hohavvr, hohavcd, hohavff, hohavwm, hohavwd, hohavdw, # household items
+    hohavmo, hohavpc, hohavdt, hohavph, hohavdv, hohav95, hohav96,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, hoprord, # housing problems
+    hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco, hopro95, hopro96,
+    hoproblem6 = case_when(
+      hocenh == 2 | hoprord == 1 | hoprocp == 1 | hoprowa == 1 | hoproro == 1 | hoproco == 1 ~ 1,
+      is.na(hocenh) & is.na(hoprord) & is.na(hoprocp) & is.na(hoprowa) & is.na(hoproro) & is.na(hoproco)~ NA_real_,
+      TRUE ~ 0
+    ),
+    hoproblemall = hopro96,
+    
+    # Psychosocial circumstances---
+    mstat = case_when(
+      mstat %in% c(1:3) ~ "married",
+      mstat %in% c(4:6) ~ "separated",
+      mstat == 7 ~ "widowed",
+      mstat == 8 ~ "never",
+      TRUE ~ NA_character_
+      ),
+    mstat = relevel(factor(mstat), ref = "married"),
+    hhres, lvalone = ifelse(hhres == 1, 1, 0), momliv, dadliv, child, livsib,
+    cchild = ifelse(scchdm %in% c(0:10), scchdm, NA), 
+    csib = ifelse(scfamm %in% c(0:10), scfamm, NA), 
+    cfriend = ifelse(scfrdm %in% c(0:10), scfrdm, NA),
+    scchd, chldmeet = scchdg, chldphone = scchdh, chldemail = scchdi, # lower frequency
+    scfam, sibmeet = scfamg, sibphone = scfamh, sibemail = scfami,
+    scfrd, friendmeet = scfrdg, friendphone = scfrdh, friendemail = scfrdi,
+    sustdfe, srely, sopenup, scritze, sletdow, sgetnev, # higher positive/negative support
+    kustdfe, krely, kopenup, kcritze, kletdow, kgetnev,
+    oustdfe, orely, oopenup, ocritze, oletdow, ogetnev, 
+    fustdfe, frely, fopenup, fcritze, fletdow, fgetnev,
+    political = scorg01, tenant = scorg02, church = scorg03, charitable = scorg04,
+    course = scorg05, club = scorg06, sport = scorg07,
+    newspaper = scpt01, internet = scpt06, phone = scpt07, holidayuk = scpt03, 
+    holidayabroad = scpt04, daytrip = scpt05,
+    volunteer = wpvw, cinema = scacta, art = scactc, theater = scactd, # lower frequency
+    tvtime = (sctvwkd*5 + sctvwke)/7, hopet,
+    belong, trust, unfriend, hlpntr, rubbish, vandal, alone, afwalk, tadvan,
+    lsrspct, prsrvc, notsmrt, harass, prtrmt, # Everyday discrimination
+    complac, leftout, isolate, lnlys3, # Loneliness
+    chdeathe = case_when(
+      rcalv == 2 | rcalv2 == 2 | rcalv3 == 2 | rcalv4 == 2 | rcalv5 == 2 | rcalv6 == 2 | rcalv7 == 2 | rcalv8 == 2 | rcalv9 == 2 | rcalv10 == 2 | rcalv11 == 2 | rcalv12 == 2 | rcalv13 == 2 ~ 1,
+      TRUE ~ 0
+    ),
+    nadise = ranadise, combate = racombate, attacke = raattacke, lifethe = ralifethe, sfnhe = rasfnhe,
+    riskf = rsriskf, longcare = rscare, witkl = rswitkl, loswr = rsloswr, sexas = rssexas, witwr = rswitwr,
+    addic = rsaddic, prison = ralis5, homeless = ralis8,
+    
+    # Healthcare systems---
+    hipriv, lifein = iaisali, rcaremt_e,
+    transportdep = case_when(
+      spcar == 2 & sptraa %in% c(4:6) ~ 1,
+      spcar == 1 | sptraa %in% c(1:3) ~ 0,
+      # spcar == 2 & (sptrab1 == 1 | sptrab2 == 1) ~ 1,
+      TRUE ~ NA_real_
+    ),
+    difftogp = case_when(
+      scedgp %in% c(1,2) ~ 0,
+      scedgp %in% c(3:6) ~ 1,
+      TRUE ~ NA_real_
+      ),
+    difftodentist = case_when(
+      scedde %in% c(1,2) ~ 0,
+      scedde %in% c(3:6) ~ 1,
+      TRUE ~ NA_real_
+      ),
+    difftooptician = case_when(
+      scedop %in% c(1,2) ~ 0,
+      scedop %in% c(3:6) ~ 1,
+      TRUE ~ NA_real_
+      ),
+    difftoshospital = case_when(
+      scedho %in% c(1,2) ~ 0,
+      scedho %in% c(3:6) ~ 1,
+      TRUE ~ NA_real_
+      ),
+    
+    # Health Behaviors---
+    smokev, smoken, smokef, drink, drink_e = scako, drinkd_e, drinkwn_e,
+    vgactx_e, mdactx_e, ltactx_e, # lower frequency
+    obesity, mbmi, sleeph, 
+    fallslp, wakent, unrested, # more difficult
+    vegetable = scveg, fruit = scfru, 
+    
+    # Outcomes---
+      # Death information
+    radyear
+  ) %>%
+  arrange(id, wave)
+# skim(tidy_elsa)
+
+rm(
+  long_elsa, long_original, elsa_lhms, tidy_2006, tidy_2008, tidy_ses,
+  id_50plus, id_4year, id_2006, id_2008, id_lhms
+  )
+
+############### Frailty index ############### 
+# Baseline
+tidy_fi_baseline <- long_merge %>%
+  filter(idauniq %in% id_include & wave == 2010) %>%
+  mutate_all(~ replace(., .< 0, NA_real_)) %>% # Replace negative values in all columns to NA
+  mutate(
+    .keep = "none",
+    id = idauniq, wave,
+    # Disease
+    hibpe, diabe, cancre, lunge, asthmae, hearte, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene,
+      # Physical function
+    dressa, batha, eata, beda, toilta, walkra, # ADLs 
+    moneya, medsa, shopa, mealsa, phonea, mapa, housewka, # IADLs
+    walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha, # Mobility limitations
+      # Self-reported health
+    prshlt = case_when(
+      shlt == 5 ~ 1,
+      shlt == 4 ~ 0.75,
+      shlt == 3 ~ 0.5,
+      shlt == 2 ~ 0.25,
+      shlt == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    dvi = case_when(
+      dsight %in% c(5:6) ~ 1,
+      dsight == 4 ~ 0.75,
+      dsight == 3 ~ 0.5,
+      dsight == 2 ~ 0.25,
+      dsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    nvi = case_when(
+      nsight %in% c(5:6) ~ 1,
+      nsight == 4 ~ 0.75,
+      nsight == 3 ~ 0.5,
+      nsight == 2 ~ 0.25,
+      nsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    hi = case_when(
+      hearing %in% c(5:6) ~ 1,
+      hearing == 4 ~ 0.75,
+      hearing == 3 ~ 0.5,
+      hearing == 2 ~ 0.25,
+      hearing == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    pain = painfr, urinai, 
+      # Depressive symptoms
+    depres, effort, whappy = 1-whappy, fsad, going, enlife = 1-enlife,
+    # cesd,
+      # Cognition
+    imrc, dlrc, orient
+    ) %>%
+  remove_all_labels() %>%
+  zap_formats()
+
+# skim(tidy_fi_baseline)
+  
+a <- tidy_fi_baseline %>%
+  mutate(perc_na = apply(., 1, count_na_row) / (ncol(.) - 2))
+print(
+  round(nrow(a %>% filter(perc_na == 0))*100 / nrow(a), 1)
+  )
+rm(a)
+
+tic()
+tidy_fi_baseline_imp <- missRanger(tidy_fi_baseline, . ~ . - id - wave, pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)  %>%
+  rowwise() %>% 
+  mutate(
+    disease = sum(c(hibpe, diabe, cancre, lunge, asthmae, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene), na.rm = F), # 16
+    adl = sum(c(dressa, batha, eata, beda, toilta, walkra), na.rm = F), # 6
+    iadl = sum(c(moneya, medsa, shopa, mealsa, phonea, mapa, housewka), na.rm = F), # 7
+    moblimit = sum(c(walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha), na.rm = T), # 10
+    depres, effort, whappy, fsad, going, enlife, # 6
+    cognition = 1 - sum(c(imrc, dlrc, orient), na.rm = F)/24, # 1
+    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, pain, urinai, depres, effort, whappy, fsad, going, enlife, cognition), na.rm = F)/52
+  ) %>%
+  ungroup() %>%
+  dplyr::select(c(id, wave), !c(id, wave))
+toc() # 10 s
+
+colnames(tidy_fi_baseline_imp)[-c(1:2)] <- str_c(colnames(tidy_fi_baseline_imp)[-c(1:2)], "_b")
+
+# Follow-up
+tidy_fi_follow <- long_merge %>%
+  filter(idauniq %in% id_include & wave == 2014) %>%
+  mutate_all(~ replace(., .< 0, NA_real_)) %>% # Replace negative values in all columns to NA
+  mutate(
+    .keep = "none",
+    id = idauniq, wave,
+    # Disease
+    hibpe, diabe, cancre, lunge, asthmae, hearte, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene,
+      # Physical function
+    dressa, batha, eata, beda, toilta, walkra, # ADLs 
+    moneya, medsa, shopa, mealsa, phonea, mapa, housewka, # IADLs
+    walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha, # Mobility limitations
+      # Self-reported health
+    prshlt = case_when(
+      shlt == 5 ~ 1,
+      shlt == 4 ~ 0.75,
+      shlt == 3 ~ 0.5,
+      shlt == 2 ~ 0.25,
+      shlt == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    dvi = case_when(
+      dsight %in% c(5:6) ~ 1,
+      dsight == 4 ~ 0.75,
+      dsight == 3 ~ 0.5,
+      dsight == 2 ~ 0.25,
+      dsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    nvi = case_when(
+      nsight %in% c(5:6) ~ 1,
+      nsight == 4 ~ 0.75,
+      nsight == 3 ~ 0.5,
+      nsight == 2 ~ 0.25,
+      nsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    hi = case_when(
+      hearing %in% c(5:6) ~ 1,
+      hearing == 4 ~ 0.75,
+      hearing == 3 ~ 0.5,
+      hearing == 2 ~ 0.25,
+      hearing == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    pain = painfr, urinai, 
+      # Depressive symptoms
+    depres, effort, whappy = 1-whappy, fsad, going, enlife = 1-enlife,
+    # cesd,
+      # Cognition
+    imrc, dlrc, orient
+    ) %>%
+  remove_all_labels() %>%
+  zap_formats()
+
+# skim(tidy_fi_follow)
+  
+a <- tidy_fi_follow %>%
+  mutate(perc_na = apply(., 1, count_na_row) / (ncol(.) - 2))
+print(
+  round(nrow(a %>% filter(perc_na == 0))*100 / nrow(a), 1)
+  )
+rm(a)
+
+tic()
+tidy_fi_follow_imp <- missRanger(tidy_fi_follow, . ~ . - id - wave, pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)  %>%
+  rowwise() %>% 
+  mutate(
+    disease = sum(c(hibpe, diabe, cancre, lunge, asthmae, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene), na.rm = F), # 16
+    adl = sum(c(dressa, batha, eata, beda, toilta, walkra), na.rm = F), # 6
+    iadl = sum(c(moneya, medsa, shopa, mealsa, phonea, mapa, housewka), na.rm = F), # 7
+    moblimit = sum(c(walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha), na.rm = T), # 10
+    depres, effort, whappy, fsad, going, enlife, # 6
+    cognition = 1 - sum(c(imrc, dlrc, orient), na.rm = F)/24, # 1
+    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, pain, urinai, depres, effort, whappy, fsad, going, enlife, cognition), na.rm = F)/52
+  ) %>%
+  ungroup() %>%
+  dplyr::select(c(id, wave), !c(id, wave))
+toc() # 10 s
+
+
+############### Relevel some variables ############### 
+# For categorical variables coding as 1-yes and 2-no
+cate_var_fac_relevel <- c("paargue", "rsunemp", "homeal", "hocenh", "hopet", "riskf", "longcare", "witkl", "loswr", "sexas", "witwr", "addic")
+
+# For categorical variables coding as 1-yes and 0-no
+cate_var_fac_relevel3 <- c("ramischlth", "pabused", "sepmom", "padrug", "padivch", "padiech", "orphanage", "fosterhome", "sexabusedch", "assaultch", "raattackch", "sfnhch", "raccbath", "raccwaterc", "raccwaterh", "racctoilet", "raccheating", "raccnofeat", "exrelefo", "ahown", "hoadpwd", "hoadprs", "hoadphr", "hoadpad", "hoadpap", "hoadpbm", "hoadpkm", "hoadpli", "hoadpcl", "hoadpal", "hoadp95", "hoadp96", "hohavtv", "hohavvr", "hohavcd", "hohavff", "hohavwm", "hohavwd", "hohavdw", "hohavmo", "hohavpc", "hohavdt", "hohavph", "hohavdv", "hohav95", "hohav96", "hoproblem6", "hoproblemall", "hoprosp", "hopronz", "hoprosn", "hoprodk", "hopropo", "hoprord", "hoprowa", "hoprocp", "hoproep", "hoproro", "hoproin", "hoproco", "political", "tenant", "church", "charitable", "course", "club", "sport", "newspaper", "internet", "phone", "holidayuk", "holidayabroad", "daytrip", "chdeathe", "nadise", "combate", "attacke", "lifethe", "sfnhe", "prison", "homeless", "hipriv", "lifein", "transportdep", "difftogp", "difftodentist", "difftooptician", "difftoshospital", "smokev", "smoken", "drink", "obesity")
+
+tidy_relevel <- tidy_elsa %>%
+  mutate_at(c(cate_var_fac_relevel), fac_relevel) %>%
+  mutate_at(c(cate_var_fac_relevel3), fac_relevel3)
+
+############### Reverse-code and Define variables ############### 
+var_reverse <- c(
+  # Adverse childhood experiences
+  "rsmcold", "rsmnotwa", "rsmdepen", "rsmoverp", "rsfcold", "rsfnotwa", "rsfdepen", "rsfoverp",
+  # Material circumstances
+  # Psychosocial circumstances
+  "chldmeet", "chldphone", "chldemail", 
+  "sibmeet", "sibphone", "sibemail",
+  "friendmeet", "friendphone", "friendemail",
+  "sustdfe", "srely", "sopenup", "scritze", "sletdow", "sgetnev",
+  "kustdfe", "krely", "kopenup", "kcritze", "kletdow", "kgetnev",
+  "oustdfe", "orely", "oopenup", "ocritze", "oletdow", "ogetnev", 
+  "fustdfe", "frely", "fopenup", "fcritze", "fletdow", "fgetnev",
+  "volunteer", "cinema", "art", "theater",
+  "vandal", "alone", "afwalk", "tadvan",
+  # Health Behaviors
+  "drink_e", "vgactx_e", "mdactx_e", "ltactx_e",
+  # Adverse Experiences
+  "lsrspct", "prsrvc", "notsmrt", "harass", "prtrmt"
+  )
+
+tidy_reverse <- tidy_relevel %>%
+  mutate_at(c(var_reverse), reverse_code) %>% 
+  mutate(
+    .keep = "unused",
+    # Adverse childhood experiences
+    mombond = rowSums(.[c("rsmlet", "rsmunder", "rsmdicde", "rsmcold", "rsmnotwa", "rsmdepen", "rsmoverp")], na.rm = T),
+    mombond = ifelse(apply(.[c("rsmlet", "rsmunder", "rsmdicde", "rsmcold", "rsmnotwa", "rsmdepen", "rsmoverp")], 1, count_na_row) > 3, NA, mombond),
+    dadbond = rowSums(.[c("rsflet", "rsfunder", "rsfdecid", "rsfcold", "rsfnotwa", "rsfdepen", "rsfoverp")], na.rm = T),
+    dadbond = ifelse(apply(.[c("rsflet", "rsfunder", "rsfdecid", "rsfcold", "rsfnotwa", "rsfdepen", "rsfoverp")], 1, count_na_row) > 3, NA, dadbond),
+    
+    # Psychosocial circumstances
+    nnsocial = rowMeans(.[c("belong", "trust", "unfriend", "hlpntr", "rubbish", "vandal", "alone", "afwalk", "tadvan")], na.rm = T),
+    nnsocial = ifelse(apply(.[c("belong", "trust", "unfriend", "hlpntr", "rubbish", "vandal", "alone", "afwalk", "tadvan")], 1, count_na_row) > 4, NA, nnsocial), # higher score - better health
+    
+    closerela = rowSums(.[c("cchild", "csib", "cfriend")], na.rm = F),
+    
+    chldcontact = rowMeans(.[c("chldmeet", "chldphone", "chldemail")], na.rm = T),
+    chldcontact = ifelse(apply(.[c("chldmeet", "chldphone", "chldemail")], 1, count_na_row) > 1, NA, chldcontact),
+    
+    sibcontact = rowMeans(.[c("sibmeet", "sibphone", "sibemail")], na.rm = T),
+    sibcontact = ifelse(apply(.[c("sibmeet", "sibphone", "sibemail")], 1, count_na_row) > 1, NA, sibcontact),
+    
+    friendcontact = rowMeans(.[c("friendmeet", "friendphone", "friendemail")], na.rm = T),
+    friendcontact = ifelse(apply(.[c("friendmeet", "friendphone", "friendemail")], 1, count_na_row) > 1, NA, friendcontact),
+    
+    sposupport = rowMeans(.[c("sustdfe", "srely", "sopenup")], na.rm = T),
+    sposupport = ifelse(apply(.[c("sustdfe", "srely", "sopenup")], 1, count_na_row) > 1, NA, sposupport),
+    
+    snegsupport = rowMeans(.[c("scritze", "sletdow", "sgetnev")], na.rm = T),
+    snegsupport = ifelse(apply(.[c("scritze", "sletdow", "sgetnev")], 1, count_na_row) > 1, NA, snegsupport),
+    
+    kposupport = rowMeans(.[c("kustdfe", "krely", "kopenup")], na.rm = T),
+    kposupport = ifelse(apply(.[c("kustdfe", "krely", "kopenup")], 1, count_na_row) > 1, NA, kposupport),
+    
+    knegsupport = rowMeans(.[c("kcritze", "kletdow", "kgetnev")], na.rm = T),
+    knegsupport = ifelse(apply(.[c("kcritze", "kletdow", "kgetnev")], 1, count_na_row) > 1, NA, knegsupport),
+    
+    oposupport = rowMeans(.[c("oustdfe", "orely", "oopenup")], na.rm = T),
+    oposupport = ifelse(apply(.[c("oustdfe", "orely", "oopenup")], 1, count_na_row) > 1, NA, oposupport),
+    
+    onegsupport = rowMeans(.[c("ocritze", "oletdow", "ogetnev")], na.rm = T),
+    onegsupport = ifelse(apply(.[c("ocritze", "oletdow", "ogetnev")], 1, count_na_row) > 1, NA, onegsupport),
+    
+    fposupport = rowMeans(.[c("fustdfe", "frely", "fopenup")], na.rm = T),
+    fposupport = ifelse(apply(.[c("fustdfe", "frely", "fopenup")], 1, count_na_row) > 1, NA, fposupport),
+    
+    fnegsupport = rowMeans(.[c("fcritze", "fletdow", "fgetnev")], na.rm = T),
+    fnegsupport = ifelse(apply(.[c("fcritze", "fletdow", "fgetnev")], 1, count_na_row) > 1, NA, fnegsupport),
+    
+    loneliness = rowMeans(.[c("complac", "leftout", "isolate")], na.rm = T),
+    loneliness = ifelse(apply(.[c("complac", "leftout", "isolate")], 1, count_na_row) > 1, NA, loneliness),
+    
+    # Health Behaviors
+    sleep = rowMeans(.[c("fallslp", "wakent", "unrested")], na.rm = T),
+    sleep = ifelse(apply(.[c("fallslp", "wakent", "unrested")], 1, count_na_row) > 1, NA, sleep),
+    
+    # Adverse Experiences
+    pdailydiscrim = rowMeans(.[c("lsrspct", "prsrvc", "notsmrt", "harass", "prtrmt")], na.rm = T),
+    pdailydiscrim = ifelse(apply(.[c("lsrspct", "prsrvc", "notsmrt", "harass", "prtrmt")], 1, count_na_row) > 2, NA, pdailydiscrim)
+  ) 
+# skim(tidy_reverse)
+
+# 5. Final datasets
+final <- tidy_reverse %>% 
+  left_join(tidy_fi_baseline_imp, by = c("id", "wave")) %>%
+  left_join(tidy_fi_follow_imp %>% dplyr::select(-wave), by = c("id")) %>%  remove_all_labels() %>%
+  zap_formats()
+# skim(final)
+
+```
+
+# Descriptive analyses
+
+## Supplementary Table 2: Descriptive statistics for missing rate of all predictors
+
+### Overall
+
+```{r}
+
+# Select variables
+missing_desc <- final %>% 
+  filter(fi_b < 0.2) %>%
+  dplyr::select(
+    age, male, 
+    ramischlth, pabused, sepmom, padrug, padivch, padiech, paargue, orphanage, fosterhome, 
+    sexabusedch, assaultch, mombond, dadbond, difjob, 
+    ramomedu, radadedu, rsunemp, sfnhch,
+    pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    white, raeducl, atotb, itot, lbrf, sclddr,
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, 
+    nnsocial,
+    chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    pdailydiscrim, loneliness,
+    nadise, combate, attacke, lifethe, sfnhe, riskf, longcare, witkl, loswr, 
+    sexas, witwr, addic, homeless,
+    smokev, smoken, drink_e, drinkwn_e, vgactx_e, mdactx_e, ltactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, transportdep, difftogp, difftodentist, difftooptician, difftoshospital) 
+
+# Calculate missing percentages for each variable
+missing_perc <- tibble(
+  variable = skim(missing_desc)$skim_variable,
+  missing_rate = (1 - skim(missing_desc)$complete_rate)*100
+)
+
+# Define variable groups
+demo <- c("age", "male")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath", "raccwaterc", "raccwaterh", "racctoilet", "raccheating", "difjob", "rsunemp", "sfnhch", 
+  "dadbond", "mombond", "sepmom", "padiech", "orphanage", "fosterhome", "ramischlth", "assaultch", "sexabusedch", "pabused", "paargue", "padrug", "padivch"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white", "lbrf")
+mc <- c("exrelefo", "ahown", "hocenh", "hoadpwd", "hoadprs", "hoadphr", "hoadpad", "hoadpap", "hoadpbm", "hoadpkm", "hoadpli", "hoadpcl", "hoadpal", "hoprosp", "hopronz", "hoprosn", "hoprodk", "hopropo", "hoprord", "hoprowa", "hoprocp", "hoproep", "hoproro", "hoproin", "hoproco")
+socc <- c(
+  "mstat", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "kposupport", "oposupport", "fposupport", "snegsupport", "knegsupport", "onegsupport", "fnegsupport", 
+  "political", "tenant", "church", "charitable", "course", "club", "sport", 
+  "newspaper", "internet", "phone", "holidayuk", "holidayabroad", "daytrip", "hopet",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise", "lifethe", "attacke", "sexas", "addic", "combate", "witwr", "witkl", "loswr", "riskf", "longcare", "sfnhe", "homeless")
+behav <- c("smokev", "smoken", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv", "difftogp", "difftodentist", "difftooptician", "difftoshospital", "transportdep")
+
+# Define the order of variables
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+# Define variable names
+var_name <- c(
+  "Age",
+  "Sex: male",
+  
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation", 
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race",
+  "Labor force status",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status", 
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# Create a list of label formulas for table summary
+label_list <- list()
+for (i in 1:length(var_name)) {
+  formula_str <- paste0(var_order[i], " ~ ", "\"", gsub("'", "'", var_name[i]), "\"")
+  label_list[[i]] <- as.formula(formula_str)
+}
+
+# Create summary table with detailed configurations
+tbl <- missing_desc %>%
+  mutate(
+    male = relevel(factor(male, labels = c("no", "yes")), ref = "no"),
+    white = relevel(factor(white, labels = c("no", "yes")), ref = "no"),
+    difjob = factor(difjob, labels = c("High", "Intermediate", "Low", "Other")),
+    lbrf = factor(lbrf, levels = c("employed", "retired", "others"), labels = c("Employed/self-employed", "Partly retired/retired", "Unemployed/disabled/looking after home or family")),
+    mstat = factor(mstat, levels = c("married", "separated", "widowed", "never"), labels = c("Married/partnered", "Separated/divorced", "Widowed", "Never married"))
+  ) %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = label_list, 
+    type = list(radadedu ~ "continuous", ramomedu ~ "continuous", raccbooks ~ "continuous", raeducl ~ "continuous", hhres ~ "continuous", volunteer ~ "continuous", cinema ~ "continuous", art ~ "continuous", theater ~ "continuous", loneliness ~ "continuous", drink_e ~ "continuous", drinkwn_e ~ "continuous", ltactx_e ~ "continuous", mdactx_e ~ "continuous", vgactx_e ~ "continuous"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)), 
+    missing = "no"
+    ) %>%
+  modify_table_body(
+    fun = ~.x %>%
+      arrange(factor(variable, levels = var_order)) %>%
+      left_join(missing_perc, by = "variable") %>%
+      mutate(
+        missing_rate = case_when(
+          row_type == "label" ~ missing_rate,
+          TRUE ~ NA_real_
+        )
+      )
+     ) %>%
+  modify_header(
+    label = "**Variable**",
+    missing_rate = "**Missing rate (%)**"
+    ) %>%
+  modify_fmt_fun(missing_rate ~ function(x) style_number(x, digits = 1))
+
+tbl %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "E:/Multiple cohort study/Harmonized Data FIile/HarmonizedSurveyData/social_factors_health/results/Table/Table 1_missing predictors_overall_elsa.docx")
+
+rm(missing_desc, missing_perc, tbl)
+
+```
+
+### By sex
+
+```{r}
+
+# Select variables
+missing_desc <- final %>% 
+  filter(fi_b < 0.2) %>%
+  dplyr::select(
+    age, male, 
+    ramischlth, pabused, sepmom, padrug, padivch, padiech, paargue, orphanage, fosterhome, 
+    sexabusedch, assaultch, mombond, dadbond, difjob, 
+    ramomedu, radadedu, rsunemp, sfnhch,
+    pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    white, raeducl, atotb, itot, lbrf, sclddr,
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, 
+    nnsocial,
+    chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    pdailydiscrim, loneliness,
+    nadise, combate, attacke, lifethe, sfnhe, riskf, longcare, witkl, loswr, 
+    sexas, witwr, addic, homeless,
+    smokev, smoken, drink_e, drinkwn_e, vgactx_e, mdactx_e, ltactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, transportdep, difftogp, difftodentist, difftooptician, difftoshospital) 
+
+# Calculate missing percentages for each variable
+missing_perc <- tibble(
+  variable = skim(missing_desc)$skim_variable,
+  missing_rate = (1 - skim(missing_desc)$complete_rate)*100
+)
+
+# Define variable groups
+demo <- c("age", "male")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath", "raccwaterc", "raccwaterh", "racctoilet", "raccheating", "difjob", "rsunemp", "sfnhch", 
+  "dadbond", "mombond", "sepmom", "padiech", "orphanage", "fosterhome", "ramischlth", "assaultch", "sexabusedch", "pabused", "paargue", "padrug", "padivch"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white", "lbrf")
+# mc <- c("exrelefo", "ahown", "hoproblem6")
+mc <- c("exrelefo", "ahown", "hocenh", "hoadpwd", "hoadprs", "hoadphr", "hoadpad", "hoadpap", "hoadpbm", "hoadpkm", "hoadpli", "hoadpcl", "hoadpal", "hoprosp", "hopronz", "hoprosn", "hoprodk", "hopropo", "hoprord", "hoprowa", "hoprocp", "hoproep", "hoproro", "hoproin", "hoproco")
+socc <- c(
+  "mstat", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "kposupport", "oposupport", "fposupport", "snegsupport", "knegsupport", "onegsupport", "fnegsupport", 
+  "political", "tenant", "church", "charitable", "course", "club", "sport", 
+  "newspaper", "internet", "phone", "holidayuk", "holidayabroad", "daytrip", "hopet",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise", "lifethe", "attacke", "sexas", "addic", "combate", "witwr", "witkl", "loswr", "riskf", "longcare", "sfnhe", "homeless")
+behav <- c("smokev", "smoken", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv", "difftogp", "difftodentist", "difftooptician", "difftoshospital", "transportdep")
+
+# Define the order of variables
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+# Define variable names
+var_name <- c(
+  "Age",
+  "Sex: male",
+  
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation", 
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race",
+  "Labor force status",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status", 
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# Create a list of label formulas for table summary
+label_list <- list()
+for (i in 1:length(var_name)) {
+  formula_str <- paste0(var_order[i], " ~ ", "\"", gsub("'", "'", var_name[i]), "\"")
+  label_list[[i]] <- as.formula(formula_str)
+}
+
+# Create summary table with detailed configurations
+tbl <- missing_desc %>%
+  mutate(
+    male = relevel(factor(male, labels = c("no", "yes")), ref = "no"),
+    white = relevel(factor(white, labels = c("no", "yes")), ref = "no"),
+    difjob = factor(difjob, labels = c("High", "Intermediate", "Low", "Other")),
+    lbrf = factor(lbrf, levels = c("employed", "retired", "others"), labels = c("Employed/self-employed", "Partly retired/retired", "Unemployed/disabled/looking after home or family")),
+    mstat = factor(mstat, levels = c("married", "separated", "widowed", "never"), labels = c("Married/partnered", "Separated/divorced", "Widowed", "Never married"))
+  ) %>%
+  tbl_summary(
+    by = male,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = label_list, 
+    type = list(radadedu ~ "continuous", ramomedu ~ "continuous", raccbooks ~ "continuous", raeducl ~ "continuous", hhres ~ "continuous", volunteer ~ "continuous", cinema ~ "continuous", art ~ "continuous", theater ~ "continuous", loneliness ~ "continuous", drink_e ~ "continuous", drinkwn_e ~ "continuous", ltactx_e ~ "continuous", mdactx_e ~ "continuous", vgactx_e ~ "continuous"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)),
+    missing = "no"
+    ) %>%
+  modify_table_body(
+    fun = ~.x %>%
+      arrange(factor(variable, levels = var_order)) %>%
+      left_join(missing_perc, by = "variable") %>%
+      mutate(
+        missing_rate = case_when(
+          row_type == "label" ~ missing_rate,
+          TRUE ~ NA_real_
+        )
+      )
+     ) %>%
+  modify_header(
+    label = "**Variable**",
+    missing_rate = "**Missing rate (%)**"
+    ) %>%
+  modify_fmt_fun(missing_rate ~ function(x) style_number(x, digits = 1))
+
+tbl %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "E:/Multiple cohort study/Harmonized Data FIile/HarmonizedSurveyData/social_factors_health/results/Table/Table 1_missing predictors_by sex_elsa.docx")
+
+rm(missing_desc, missing_perc, tbl)
+
+```
+
+### By age
+
+```{r}
+
+# Select variables
+missing_desc <- final %>% 
+  filter(fi_b < 0.2) %>%
+  dplyr::select(
+    age, male, 
+    ramischlth, pabused, sepmom, padrug, padivch, padiech, paargue, orphanage, fosterhome, 
+    sexabusedch, assaultch, mombond, dadbond, difjob, 
+    ramomedu, radadedu, rsunemp, sfnhch,
+    pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    white, raeducl, atotb, itot, lbrf, sclddr,
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, 
+    nnsocial,
+    chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    pdailydiscrim, loneliness,
+    nadise, combate, attacke, lifethe, sfnhe, riskf, longcare, witkl, loswr, 
+    sexas, witwr, addic, homeless,
+    smokev, smoken, drink_e, drinkwn_e, vgactx_e, mdactx_e, ltactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, transportdep, difftogp, difftodentist, difftooptician, difftoshospital) 
+
+# Calculate missing percentages for each variable
+missing_perc <- tibble(
+  variable = skim(missing_desc)$skim_variable,
+  missing_rate = (1 - skim(missing_desc)$complete_rate)*100
+)
+
+# Define variable groups
+demo <- c("age", "male")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath", "raccwaterc", "raccwaterh", "racctoilet", "raccheating", "difjob", "rsunemp", "sfnhch", 
+  "dadbond", "mombond", "sepmom", "padiech", "orphanage", "fosterhome", "ramischlth", "assaultch", "sexabusedch", "pabused", "paargue", "padrug", "padivch"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white", "lbrf")
+# mc <- c("exrelefo", "ahown", "hoproblem6")
+mc <- c("exrelefo", "ahown", "hocenh", "hoadpwd", "hoadprs", "hoadphr", "hoadpad", "hoadpap", "hoadpbm", "hoadpkm", "hoadpli", "hoadpcl", "hoadpal", "hoprosp", "hopronz", "hoprosn", "hoprodk", "hopropo", "hoprord", "hoprowa", "hoprocp", "hoproep", "hoproro", "hoproin", "hoproco")
+socc <- c(
+  "mstat", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "kposupport", "oposupport", "fposupport", "snegsupport", "knegsupport", "onegsupport", "fnegsupport", 
+  "political", "tenant", "church", "charitable", "course", "club", "sport", 
+  "newspaper", "internet", "phone", "holidayuk", "holidayabroad", "daytrip", "hopet",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise", "lifethe", "attacke", "sexas", "addic", "combate", "witwr", "witkl", "loswr", "riskf", "longcare", "sfnhe", "homeless")
+behav <- c("smokev", "smoken", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv", "difftogp", "difftodentist", "difftooptician", "difftoshospital", "transportdep")
+
+# Define the order of variables
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+# Define variable names
+var_name <- c(
+  "Age",
+  "Sex: male",
+  
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation", 
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race",
+  "Labor force status",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status", 
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# Create a list of label formulas for table summary
+label_list <- list()
+for (i in 1:length(var_name)) {
+  formula_str <- paste0(var_order[i], " ~ ", "\"", gsub("'", "'", var_name[i]), "\"")
+  label_list[[i]] <- as.formula(formula_str)
+}
+
+# Create summary table with detailed configurations
+tbl <- missing_desc %>%
+  mutate(
+    agegroup = relevel(factor(ifelse(age >= 65, ">=65", "<65")), ref = "<65"),
+    male = relevel(factor(male, labels = c("no", "yes")), ref = "no"),
+    white = relevel(factor(white, labels = c("no", "yes")), ref = "no"),
+    difjob = factor(difjob, labels = c("High", "Intermediate", "Low", "Other")),
+    lbrf = factor(lbrf, levels = c("employed", "retired", "others"), labels = c("Employed/self-employed", "Partly retired/retired", "Unemployed/disabled/looking after home or family")),
+    mstat = factor(mstat, levels = c("married", "separated", "widowed", "never"), labels = c("Married/partnered", "Separated/divorced", "Widowed", "Never married"))
+  ) %>%
+  tbl_summary(
+    by = agegroup,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = label_list, 
+    type = list(radadedu ~ "continuous", ramomedu ~ "continuous", raccbooks ~ "continuous", raeducl ~ "continuous", hhres ~ "continuous", volunteer ~ "continuous", cinema ~ "continuous", art ~ "continuous", theater ~ "continuous", loneliness ~ "continuous", drink_e ~ "continuous", drinkwn_e ~ "continuous", ltactx_e ~ "continuous", mdactx_e ~ "continuous", vgactx_e ~ "continuous"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)),
+    missing = "no"
+    ) %>%
+  modify_table_body(
+    fun = ~.x %>%
+      arrange(factor(variable, levels = var_order)) %>%
+      left_join(missing_perc, by = "variable") %>%
+      mutate(
+        missing_rate = case_when(
+          row_type == "label" ~ missing_rate,
+          TRUE ~ NA_real_
+        )
+      )
+     ) %>%
+  modify_header(
+    label = "**Variable**",
+    missing_rate = "**Missing rate (%)**"
+    ) %>%
+  modify_fmt_fun(missing_rate ~ function(x) style_number(x, digits = 1))
+
+tbl %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "E:/Multiple cohort study/Harmonized Data FIile/HarmonizedSurveyData/social_factors_health/results/Table/Table 1_missing predictors_by age_elsa.docx")
+
+rm(missing_desc, missing_perc, tbl)
+
+```
+
+## Supplementary Table 5: Descriptive statistics for missing rate of frailty index
+
+### Baseline
+
+```{r}
+
+id_nonf <- final %>% filter(fi_b < 0.2) %>% pull(id)
+
+missing_fi <- long_merge %>%
+  filter(idauniq %in% id_nonf & wave == 2010) %>%
+  mutate_all(~ replace(., .< 0, NA_real_)) %>% # Replace negative values in all columns to NA
+  mutate(
+    .keep = "none",
+    id = idauniq, wave,
+    # Disease
+    hibpe, diabe, cancre, lunge, asthmae, hearte, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene,
+    # Physical function
+    dressa, batha, eata, beda, toilta, walkra, # ADLs 
+    moneya, medsa, shopa, mealsa, phonea, mapa, housewka, # IADLs
+    walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha, # Mobility limitations
+    # Self-reported health
+    prshlt = case_when(
+      shlt == 5 ~ 1,
+      shlt == 4 ~ 0.75,
+      shlt == 3 ~ 0.5,
+      shlt == 2 ~ 0.25,
+      shlt == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    dvi = case_when(
+      dsight %in% c(5:6) ~ 1,
+      dsight == 4 ~ 0.75,
+      dsight == 3 ~ 0.5,
+      dsight == 2 ~ 0.25,
+      dsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    nvi = case_when(
+      nsight %in% c(5:6) ~ 1,
+      nsight == 4 ~ 0.75,
+      nsight == 3 ~ 0.5,
+      nsight == 2 ~ 0.25,
+      nsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    hi = case_when(
+      hearing %in% c(5:6) ~ 1,
+      hearing == 4 ~ 0.75,
+      hearing == 3 ~ 0.5,
+      hearing == 2 ~ 0.25,
+      hearing == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    pain = painfr, urinai, 
+    # Depressive symptoms
+    depres, effort, whappy = 1-whappy, fsad, going, enlife = 1-enlife,
+    # cesd,
+    # Cognition
+    imrc, dlrc, orient
+    ) %>%
+  remove_all_labels() %>%
+  zap_formats() %>%
+  rowwise() %>% 
+  mutate(
+    disease = sum(c(hibpe, diabe, cancre, lunge, asthmae, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene), na.rm = F),
+    adl = sum(c(dressa, batha, eata, beda, toilta, walkra), na.rm = F),
+    iadl = sum(c(moneya, medsa, shopa, mealsa, phonea, mapa, housewka), na.rm = F),
+    moblimit = sum(c(walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha), na.rm = T),
+    depres, effort, whappy, fsad, going, enlife, # 6
+    cognition = 1 - sum(c(imrc, dlrc, orient), na.rm = F)/24, # 1
+    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, pain, urinai, depres, effort, whappy, fsad, going, enlife, cognition), na.rm = F)/52
+  ) %>%
+  ungroup() %>%
+  dplyr::select(hibpe, diabe, cancre, lunge, asthmae, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene, dressa, batha, eata, beda, toilta, walkra, moneya, medsa, shopa, mealsa, phonea, mapa, housewka, walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha, pain, urinai, depres, effort, whappy, fsad, going, enlife, cognition, prshlt, dvi, nvi, hi) %>%
+  mutate_at(.vars = c("hibpe", "diabe", "cancre", "lunge", "asthmae", "angine", "hrtatte", "conhrtfe", "hrtrhme", "stroke", "arthre", "psyche", "osteoe", "parkine", "alzhe", "demene", "dressa", "batha", "eata", "beda", "toilta", "walkra", "moneya", "medsa", "shopa", "mealsa", "phonea", "mapa", "housewka", "walk100a", "sita", "chaira", "climsa", "clim1a", "stoopa", "lifta", "dimea", "armsa", "pusha", "pain", "urinai", "depres", "effort", "whappy", "fsad", "going", "enlife"), .funs = fac_relevel3)
+
+# Calculate missing percentages for each variable
+missing_perc <- tibble(
+  variable = skim(missing_fi)$skim_variable,
+  missing_rate = (1 - skim(missing_fi)$complete_rate)*100
+)
+
+# Define the order of variables
+var_order <- c("hibpe", "diabe", "cancre", "lunge", "asthmae", "angine", "hrtatte", "conhrtfe", "hrtrhme", "stroke", "arthre", "osteoe", "psyche", "parkine", "alzhe", "demene", "dressa", "batha", "eata", "beda", "toilta", "walkra", "moneya", "medsa", "shopa", "mealsa", "phonea", "mapa", "housewka", "walk100a", "sita", "chaira", "climsa", "clim1a", "stoopa", "lifta", "dimea", "armsa", "pusha", "pain", "urinai", "depres", "effort", "whappy", "fsad", "going", "enlife", "cognition", "prshlt", "dvi", "nvi", "hi")
+
+# Define variable names 
+var_name <- c(
+  "Ever had high blood pressure or hypertension",
+  "Ever had diabetes or high blood sugar",
+  "Ever had cancer or a malignant tumor (excluding minor skin cancers)",
+  "Ever had chronic lung disease such as chronic bronchitis or emphysema",
+  "Ever had asthma",
+  "Ever had angina",
+  "Ever had a heart attack (including myocardial infarction or coronary thrombosis)",
+  "Ever had congestive heart failure",
+  "Ever had an abnormal heart rhythm",
+  "Ever had stroke (cerebrovascular disease)",
+  "Ever had arthritis (including osteoarthritis or rheumatism)",
+  "Ever had osteoporosis",
+  "Ever had any emotional, nervous, or psychiatric problems",
+  "Ever had Parkinson's disease",
+  "Ever had Alzheimer's disease",
+  "Ever had dementia, organic brain senility, or any other serious memory condition",
+  
+  "Limitations in dressing",
+  "Limitations in bathing or showering",
+  "Limitations in eating",
+  "Limitations in getting into or out of bed",
+  "Limitations in using the toilet",
+  "Limitations in walking across a room",
+  
+  "Limitations in managing money",
+  "Limitations in taking medications",
+  "Limitations in shopping for groceries",
+  "Limitations in preparing hot meals",
+  "Limitations in using the telephone",
+  "Limitations in using map",
+  "Limitations in doing work around the house or garden",
+  
+  "Limitations in walking 100 yards",
+  "Limitations in sitting for two hours",
+  "Limitations in getting up from a chair",
+  "Limitations in climbing several flights of stairs",
+  "Limitations in climbing one flight of stairs",
+  "Limitations in stooping, kneeling, or crouching",
+  "Limitations in lifting or carrying weights over 10 pounds",
+  "Limitations in picking up a 5p coin from the table",
+  "Limitations in reaching arms above shoulder level",
+  "Limitations in pushing or pulling large objects",
+  
+  "Experiences frequent pain",
+  "Experienced any urinary incontinence in last year",
+  "Felt depressed",
+  "Felt that everything they did was an effort",
+  "Was not happy",
+  "Felt sad",
+  "Did not enjoy life",
+  "Could not get going",
+  "Cognitive decline",
+  "Self-rating of health",
+  "Distance vision impairment",
+  "Near vision impairment",
+  "Hearing impairment"
+  )
+
+# Create a list of label formulas for table summary
+label_list <- list()
+for (i in 1:length(var_name)) {
+  formula_str <- paste0(var_order[i], " ~ ", "\"", gsub("'", "'", var_name[i]), "\"")
+  label_list[[i]] <- as.formula(formula_str)
+}
+
+# Create summary table with detailed configurations
+tbl <- missing_fi %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = label_list,
+    type = list(cognition ~ "continuous", prshlt ~ "continuous", dvi ~ "continuous", nvi ~ "continuous", hi ~ "continuous"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)),
+    missing = "no"
+    ) %>%
+  modify_table_body(
+    fun = ~.x %>%
+      arrange(factor(variable, levels = var_order)) %>%
+      left_join(missing_perc, by = "variable") %>%
+      mutate(
+        missing_rate = case_when(
+          row_type == "label" ~ missing_rate,
+          TRUE ~ NA_real_
+        )
+      )
+  ) %>%
+  modify_header(
+    label = "**Variable**",
+    missing_rate = "**Missing rate (%)**"
+  ) %>%
+  modify_fmt_fun(missing_rate ~ function(x) style_number(x, digits = 1)) %>%
+  modify_footnote(
+    label ~ "Data are presented as Mean (standard error) or Frequency (%).",
+    all_stat_cols() ~ NA
+  )
+
+tbl %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "E:/Multiple cohort study/Harmonized Data FIile/HarmonizedSurveyData/social_factors_health/results/Table/Table 1_ missing fi_baseline_elsa.docx")
+
+rm(missing_fi, missing_perc, tbl)
+
+```
+
+### Follow-up
+
+```{r}
+
+missing_fi <- long_merge %>%
+  filter(idauniq %in% id_nonf & wave == 2014) %>%
+  mutate_all(~ replace(., .< 0, NA_real_)) %>% # Replace negative values in all columns to NA
+  mutate(
+    .keep = "none",
+    id = idauniq, wave,
+    # Disease
+    hibpe, diabe, cancre, lunge, asthmae, hearte, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene,
+    # Physical function
+    dressa, batha, eata, beda, toilta, walkra, # ADLs 
+    moneya, medsa, shopa, mealsa, phonea, mapa, housewka, # IADLs
+    walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha, # Mobility limitations
+    # Self-reported health
+    prshlt = case_when(
+      shlt == 5 ~ 1,
+      shlt == 4 ~ 0.75,
+      shlt == 3 ~ 0.5,
+      shlt == 2 ~ 0.25,
+      shlt == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    dvi = case_when(
+      dsight %in% c(5:6) ~ 1,
+      dsight == 4 ~ 0.75,
+      dsight == 3 ~ 0.5,
+      dsight == 2 ~ 0.25,
+      dsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    nvi = case_when(
+      nsight %in% c(5:6) ~ 1,
+      nsight == 4 ~ 0.75,
+      nsight == 3 ~ 0.5,
+      nsight == 2 ~ 0.25,
+      nsight == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    hi = case_when(
+      hearing %in% c(5:6) ~ 1,
+      hearing == 4 ~ 0.75,
+      hearing == 3 ~ 0.5,
+      hearing == 2 ~ 0.25,
+      hearing == 1 ~ 0,
+      TRUE ~ NA_real_
+      ),
+    pain = painfr, urinai, 
+    # Depressive symptoms
+    depres, effort, whappy = 1-whappy, fsad, going, enlife = 1-enlife,
+    # cesd,
+    # Cognition
+    imrc, dlrc, orient
+    ) %>%
+  remove_all_labels() %>%
+  zap_formats() %>%
+  rowwise() %>% 
+  mutate(
+    disease = sum(c(hibpe, diabe, cancre, lunge, asthmae, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene), na.rm = F),
+    adl = sum(c(dressa, batha, eata, beda, toilta, walkra), na.rm = F),
+    iadl = sum(c(moneya, medsa, shopa, mealsa, phonea, mapa, housewka), na.rm = F),
+    moblimit = sum(c(walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha), na.rm = T),
+    depres, effort, whappy, fsad, going, enlife, # 6
+    cognition = 1 - sum(c(imrc, dlrc, orient), na.rm = F)/24, # 1
+    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, pain, urinai, depres, effort, whappy, fsad, going, enlife, cognition), na.rm = F)/52
+  ) %>%
+  ungroup() %>%
+  dplyr::select(hibpe, diabe, cancre, lunge, asthmae, angine, hrtatte, conhrtfe, hrtrhme, stroke, arthre, psyche, osteoe, parkine, alzhe, demene, dressa, batha, eata, beda, toilta, walkra, moneya, medsa, shopa, mealsa, phonea, mapa, housewka, walk100a, sita, chaira, climsa, clim1a, stoopa, lifta, dimea, armsa, pusha, pain, urinai, depres, effort, whappy, fsad, going, enlife, cognition, prshlt, dvi, nvi, hi) %>%
+  mutate_at(.vars = c("hibpe", "diabe", "cancre", "lunge", "asthmae", "angine", "hrtatte", "conhrtfe", "hrtrhme", "stroke", "arthre", "psyche", "osteoe", "parkine", "alzhe", "demene", "dressa", "batha", "eata", "beda", "toilta", "walkra", "moneya", "medsa", "shopa", "mealsa", "phonea", "mapa", "housewka", "walk100a", "sita", "chaira", "climsa", "clim1a", "stoopa", "lifta", "dimea", "armsa", "pusha", "pain", "urinai", "depres", "effort", "whappy", "fsad", "going", "enlife"), .funs = fac_relevel3)
+
+# Calculate missing percentages for each variable
+missing_perc <- tibble(
+  variable = skim(missing_fi)$skim_variable,
+  missing_rate = (1 - skim(missing_fi)$complete_rate)*100
+)
+
+# Define the order of variables
+var_order <- c("hibpe", "diabe", "cancre", "lunge", "asthmae", "angine", "hrtatte", "conhrtfe", "hrtrhme", "stroke", "arthre", "osteoe", "psyche", "parkine", "alzhe", "demene", "dressa", "batha", "eata", "beda", "toilta", "walkra", "moneya", "medsa", "shopa", "mealsa", "phonea", "mapa", "housewka", "walk100a", "sita", "chaira", "climsa", "clim1a", "stoopa", "lifta", "dimea", "armsa", "pusha", "pain", "urinai", "depres", "effort", "whappy", "fsad", "going", "enlife", "cognition", "prshlt", "dvi", "nvi", "hi")
+
+# Define variable names 
+var_name <- c(
+  "Ever had high blood pressure or hypertension",
+  "Ever had diabetes or high blood sugar",
+  "Ever had cancer or a malignant tumor (excluding minor skin cancers)",
+  "Ever had chronic lung disease such as chronic bronchitis or emphysema",
+  "Ever had asthma",
+  "Ever had angina",
+  "Ever had a heart attack (including myocardial infarction or coronary thrombosis)",
+  "Ever had congestive heart failure",
+  "Ever had an abnormal heart rhythm",
+  "Ever had stroke (cerebrovascular disease)",
+  "Ever had arthritis (including osteoarthritis or rheumatism)",
+  "Ever had osteoporosis",
+  "Ever had any emotional, nervous, or psychiatric problems",
+  "Ever had Parkinson's disease",
+  "Ever had Alzheimer's disease",
+  "Ever had dementia, organic brain senility, or any other serious memory condition",
+  
+  "Limitations in dressing",
+  "Limitations in bathing or showering",
+  "Limitations in eating",
+  "Limitations in getting into or out of bed",
+  "Limitations in using the toilet",
+  "Limitations in walking across a room",
+  
+  "Limitations in managing money",
+  "Limitations in taking medications",
+  "Limitations in shopping for groceries",
+  "Limitations in preparing hot meals",
+  "Limitations in using the telephone",
+  "Limitations in using map",
+  "Limitations in doing work around the house or garden",
+  
+  "Limitations in walking 100 yards",
+  "Limitations in sitting for two hours",
+  "Limitations in getting up from a chair",
+  "Limitations in climbing several flights of stairs",
+  "Limitations in climbing one flight of stairs",
+  "Limitations in stooping, kneeling, or crouching",
+  "Limitations in lifting or carrying weights over 10 pounds",
+  "Limitations in picking up a 5p coin from the table",
+  "Limitations in reaching arms above shoulder level",
+  "Limitations in pushing or pulling large objects",
+  
+  "Experiences frequent pain",
+  "Experienced any urinary incontinence in last year",
+  "Felt depressed",
+  "Felt that everything they did was an effort",
+  "Was not happy",
+  "Felt sad",
+  "Did not enjoy life",
+  "Could not get going",
+  "Cognitive decline",
+  "Self-rating of health",
+  "Distance vision impairment",
+  "Near vision impairment",
+  "Hearing impairment"
+  )
+
+# Create a list of label formulas for table summary
+label_list <- list()
+for (i in 1:length(var_name)) {
+  formula_str <- paste0(var_order[i], " ~ ", "\"", gsub("'", "'", var_name[i]), "\"")
+  label_list[[i]] <- as.formula(formula_str)
+}
+
+# Create summary table with detailed configurations
+tbl <- missing_fi %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = label_list,
+    type = list(cognition ~ "continuous", prshlt ~ "continuous", dvi ~ "continuous", nvi ~ "continuous", hi ~ "continuous"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ c(0, 1)),
+    missing = "no"
+    ) %>%
+  modify_table_body(
+    fun = ~.x %>%
+      arrange(factor(variable, levels = var_order)) %>%
+      left_join(missing_perc, by = "variable") %>%
+      mutate(
+        missing_rate = case_when(
+          row_type == "label" ~ missing_rate,
+          TRUE ~ NA_real_
+        )
+      )
+  ) %>%
+  modify_header(
+    label = "**Variable**",
+    missing_rate = "**Missing rate (%)**"
+  ) %>%
+  modify_fmt_fun(missing_rate ~ function(x) style_number(x, digits = 1)) %>%
+  modify_footnote(
+    label ~ "Data are presented as Mean (standard error) or Frequency (%).",
+    all_stat_cols() ~ NA
+  )
+  
+tbl %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "E:/Multiple cohort study/Harmonized Data FIile/HarmonizedSurveyData/social_factors_health/results/Table/Table 1_ missing fi_followup_elsa.docx")
+
+rm(missing_fi, missing_perc, tbl)
+
+```
+
+
+## Heatamp for predictors
+
+```{r}
+
+predictors <- final %>%
+  filter(fi_b < 0.2) %>%
+  dplyr::select(
+    age, male, 
+    ramischlth, pabused, sepmom, padrug, padivch, padiech, paargue, orphanage, fosterhome, 
+    sexabusedch, assaultch, mombond, dadbond, difjob, 
+    ramomedu, radadedu, rsunemp, sfnhch,
+    pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    white, raeducl, atotb, itot, lbrf, sclddr,
+    # exrelefo, ahown, hoproblem6,
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, 
+    nnsocial,
+    chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    pdailydiscrim, loneliness,
+    nadise, combate, attacke, lifethe, sfnhe, riskf, longcare, witkl, loswr, 
+    sexas, witwr, addic, homeless,
+    smokev, smoken, drink_e, drinkwn_e, vgactx_e, mdactx_e, ltactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, transportdep, difftogp, difftodentist, difftooptician, difftoshospital) 
+
+cate_var <- predictors %>% 
+  dplyr::select(where(is.factor)) %>%
+  colnames()
+
+cont_var <- predictors %>% 
+  dplyr::select(where(is.numeric)) %>%
+  colnames()
+
+transformed_predictors <- predictors %>%
+  mutate_if(is.factor, as.numeric)
+
+# Define variable groups
+demo <- c("age", "male")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath", "raccwaterc", "raccwaterh", "racctoilet", "raccheating", "difjob", "rsunemp", "sfnhch", 
+  "dadbond", "mombond", "sepmom", "padiech", "orphanage", "fosterhome", "ramischlth", "assaultch", "sexabusedch", "pabused", "paargue", "padrug", "padivch"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white", "lbrf")
+# mc <- c("exrelefo", "ahown", "hoproblem6")
+mc <- c("exrelefo", "ahown", "hocenh", "hoadpwd", "hoadprs", "hoadphr", "hoadpad", "hoadpap", "hoadpbm", "hoadpkm", "hoadpli", "hoadpcl", "hoadpal", "hoprosp", "hopronz", "hoprosn", "hoprodk", "hopropo", "hoprord", "hoprowa", "hoprocp", "hoproep", "hoproro", "hoproin", "hoproco")
+socc <- c(
+  "mstat", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "snegsupport", "kposupport", "knegsupport", "oposupport", "onegsupport", "fposupport", "fnegsupport", 
+  "political", "tenant", "church", "charitable", "course", "club", "sport", 
+  "newspaper", "internet", "phone", "holidayuk", "holidayabroad", "daytrip", "hopet",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise", "lifethe", "attacke", "sexas", "addic", "combate", "witwr", "witkl", "loswr", "riskf", "longcare", "sfnhe", "homeless")
+behav <- c("smokev", "smoken", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv", "difftogp", "difftodentist", "difftooptician", "difftoshospital", "transportdep")
+
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+# Define variable names
+var_name <- c(
+  "Age",
+  "Sex: male",
+  
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation", 
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race",
+  "Labor force status",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status", 
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# Calculate spearman correlation matrix
+cor_matrix <- cor(transformed_predictors, method = "spearman", use = "pairwise.complete.obs")
+heatmap_mat_elsa <- cor_matrix[, var_order]
+colnames(heatmap_mat_elsa) <- var_name
+heatmap_mat_elsa <- heatmap_mat_elsa[var_order,]
+rownames(heatmap_mat_elsa) <- var_name
+
+rm(predictors, cor_matrix)
+
+```
+
+# Develop machine learning models 
+
+```{r}
+
+opt_hyper_elsa <- tibble(
+  group = c("overall", "female", "male", "<65 years", "≥65 years"), 
+  mtry = NA, trees = NA, min_n = NA, tree_depth = NA, 
+  learn_rate = NA, loss_reduction = NA, sample_size = NA, stop_iter = NA
+)
+
+```
+
+## Overall
+
+### Data preparation
+
+```{r}
+
+# Train-test split
+data <- final %>%
+  filter(fi_b < 0.2) %>%
+  dplyr::select(
+    age, male, 
+    ramomedu, radadedu, pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    difjob, rsunemp, sfnhch,
+    mombond, dadbond, sepmom, padiech, orphanage, fosterhome, ramischlth, assaultch, sexabusedch, 
+    pabused, paargue, padrug, padivch, 
+    raeducl, atotb, itot, sclddr, white, lbrf, 
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, nnsocial,
+    pdailydiscrim, loneliness,
+    nadise, lifethe, attacke, sexas, addic, combate, witwr, witkl, loswr, riskf, longcare, sfnhe, 
+    homeless,
+    smokev, smoken, drink_e, drinkwn_e, ltactx_e, mdactx_e, vgactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, difftogp, difftodentist, difftooptician, difftoshospital, transportdep, 
+    fi)
+# 3773 participants
+
+set.seed(12345)
+elsa_split <- initial_split(data, prop = 0.8)
+train_elsa <- training(elsa_split)
+test_elsa  <- testing(elsa_split)
+
+# Missing value imputation
+tic()
+train_preped <- missRanger(train_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 16 s
+train_preped$fi <- train_elsa$fi
+
+tic()
+test_preped <- missRanger(test_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 11 s
+test_preped$fi <- test_elsa$fi
+# skim(test_preped)
+
+# Data baking
+train_baked <- recipe(fi ~ ., data = train_preped) %>%
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+test_baked <- recipe(fi ~ ., data = test_preped) %>%
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+#### Save data for GA2M ####
+write.csv(train_baked, file = "train_baked_elsa.csv", row.names = F)
+write.csv(test_baked, file = "test_baked_elsa.csv", row.names = F)
+
+```
+
+### Model comparison
+
+```{r}
+
+# Preprocessing and virtual encoding
+elsa_rec <- recipe(fi ~ ., data = train_preped) %>%
+  step_dummy(all_factor_predictors(), one_hot = F)
+
+# Cross-validation setup
+set.seed(12345)
+elsa_cv_folds <- rsample::vfold_cv(train_preped, v = 3)
+
+# Model definitions
+# SVM model
+svm_mod <- svm_rbf(
+  cost = tune(),
+  rbf_sigma = tune()
+) %>%
+  set_engine("kernlab") %>%
+  set_mode("regression")
+
+# XGBoost model
+xgb_mod <- boost_tree(
+  trees = tune(), # nrounds
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),  
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune(),
+  stop_iter = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+# Random Forest model
+rf_mod <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# Lasso model
+lasso_mod <- linear_reg(
+  penalty = tune(),
+  mixture = 1  # Lasso
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+# Elastic Net model
+elastic_mod <- linear_reg(
+  penalty = tune(),
+  mixture = tune()  # Elastic Net
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+# Parameter grids
+# SVM parameter grid
+set.seed(12345)
+svm_grid <- grid_latin_hypercube(
+  cost(range = c(-10, 10), trans = log10_trans()),
+  rbf_sigma(range = c(-10, 10), trans = log10_trans()),
+  size = 50
+)
+
+# XGBoost parameter grid
+set.seed(12345)
+xgb_grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(), # max_depth
+  min_n(), # min_child_weight
+  loss_reduction(), # gamma
+  sample_size = sample_prop(), # subsample
+  finalize(mtry(), train_preped), # colsample_bynode
+  learn_rate(),
+  stop_iter(),
+  size = 50
+)
+
+# Random Forest parameter grid
+set.seed(12345)
+rf_grid <- grid_latin_hypercube(
+  mtry(range = c(1, ncol(train_preped) - 1)),
+  trees(range = c(100, 1000)),
+  min_n(range = c(10, 50)),
+  size = 50
+)
+
+# Lasso parameter grid
+set.seed(12345)
+lasso_grid <- grid_regular(
+  penalty(range = c(-10, 0)),
+  levels = 50
+)
+
+# Elastic Net parameter grid
+set.seed(12345)
+elastic_grid <- grid_latin_hypercube(
+  penalty(range = c(-10, 0)),
+  mixture(range = c(0, 1)),
+  size = 50
+)
+
+# Model performance metrics
+model_metrics <- yardstick::metric_set(mae, rmse, rsq)
+
+# Model tuning
+# SVM
+svm_wf <- create_workflow(svm_mod, elsa_rec)
+svm_tuned <- tune_model(svm_wf, elsa_cv_folds, svm_grid, model_metrics) # 450s
+svm_best_params <- svm_tuned %>% select_best(metric = "mae")
+
+# XGBoost
+xgb_wf <- create_workflow(xgb_mod, elsa_rec)
+xgb_tuned <- tune_model(xgb_wf, elsa_cv_folds, xgb_grid, model_metrics) # 450s
+xgb_best_params <- xgb_tuned %>% select_best(metric = "mae")
+
+# Random Forest
+rf_wf <- create_workflow(rf_mod, elsa_rec)
+rf_tuned <- tune_model(rf_wf, elsa_cv_folds, rf_grid, model_metrics) # 600s
+rf_best_params <- rf_tuned %>% select_best(metric = "mae")
+
+# Lasso
+lasso_wf <- create_workflow(lasso_mod, elsa_rec)
+lasso_tuned <- tune_model(lasso_wf, elsa_cv_folds, lasso_grid, model_metrics) # 15s
+lasso_best_params <- lasso_tuned %>% select_best(metric = "mae")
+
+# Elastic Net
+elastic_wf <- create_workflow(elastic_mod, elsa_rec)
+elastic_tuned <- tune_model(elastic_wf, elsa_cv_folds, elastic_grid, model_metrics) # 20s
+elastic_best_params <- elastic_tuned %>% select_best(metric = "mae")
+
+# Constructing final models
+# SVM final model
+svm_final_wf <- svm_wf %>% finalize_workflow(svm_best_params)
+set.seed(12345)
+final_svm_mod <- svm_final_wf %>% fit(data = train_preped)
+
+# XGBoost final model
+xgb_final_wf <- xgb_wf %>% finalize_workflow(xgb_best_params)
+set.seed(12345)
+final_xgb_mod <- xgb_final_wf %>% fit(data = train_preped)
+
+# Random Forest final model
+rf_final_wf <- rf_wf %>% finalize_workflow(rf_best_params)
+set.seed(12345)
+final_rf_mod <- rf_final_wf %>% fit(data = train_preped)
+
+# Lasso final model
+lasso_final_wf <- lasso_wf %>% finalize_workflow(lasso_best_params)
+set.seed(12345)
+final_lasso_mod <- lasso_final_wf %>% fit(data = train_preped)
+
+# Elastic Net final model
+elastic_final_wf <- elastic_wf %>% finalize_workflow(elastic_best_params)
+set.seed(12345)
+final_elastic_mod <- elastic_final_wf %>% fit(data = train_preped)
+
+
+# Training and test set performance evaluation
+# Training set performance
+train_metrics <- list(
+  SVM = evaluate_model(final_svm_mod, train_preped),
+  XGBoost = evaluate_model(final_xgb_mod, train_preped),
+  RandomForest = evaluate_model(final_rf_mod, train_preped),
+  Lasso = evaluate_model(final_lasso_mod, train_preped),
+  ElasticNet = evaluate_model(final_elastic_mod, train_preped)
+)
+
+# Test set performance
+test_metrics <- list(
+  SVM = evaluate_model(final_svm_mod, test_preped),
+  XGBoost = evaluate_model(final_xgb_mod, test_preped),
+  RandomForest = evaluate_model(final_rf_mod, test_preped),
+  Lasso = evaluate_model(final_lasso_mod, test_preped),
+  ElasticNet = evaluate_model(final_elastic_mod, test_preped)
+)
+
+performance_df <- bind_rows(
+  mutate(test_metrics$SVM, Model = "SVM"),
+  mutate(test_metrics$XGBoost, Model = "XGBoost"),
+  mutate(test_metrics$RandomForest, Model = "Random Forest"),
+  mutate(test_metrics$Lasso, Model = "Lasso"),
+  mutate(test_metrics$ElasticNet, Model = "Elastic Net")
+) %>%
+  pivot_wider(
+    names_from = .metric, 
+    values_from = .estimate
+  ) %>%
+  mutate(across(c(rmse, mae, rsq), as.numeric))
+
+# Cross-validation performance
+model_cv_summary <- analyze_all_models(
+  svm_tuned, svm_best_params,
+  xgb_tuned, xgb_best_params,
+  rf_tuned, rf_best_params,
+  lasso_tuned, lasso_best_params,
+  elastic_tuned, elastic_best_params
+)
+
+
+```
+
+### xgboost
+
+```{r}
+
+# Preprocessing and Dummy Encoding
+elsa_rec <- recipe(fi ~ ., data = train_preped) %>% 
+  step_dummy(all_factor_predictors(), one_hot = F)
+
+## Cross-Validation Setup
+set.seed(12345)
+elsa_cv_folds <- rsample::vfold_cv(train_preped, v = 10)
+
+# Model Specification and Hyperparameter Tuning
+xgb_mod <- boost_tree(
+  trees = tune(), # nrounds
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),  
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune(),
+  stop_iter = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+## Create Hyperparameter Search Grid
+set.seed(12345)
+xgb_grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(), # max_depth
+  min_n(), # min_child_weight
+  loss_reduction(), # gamma
+  sample_size = sample_prop(), # subsample
+  finalize(mtry(), train_preped), # colsample_bynode
+  learn_rate(),
+  stop_iter(),
+  size = 100
+)
+
+# Create Workflow
+xgb_wf <- 
+  workflow() %>% 
+  add_recipe(elsa_rec) %>%
+  add_model(xgb_mod) 
+
+# Parallel Computing for Hyperparameter Tuning
+n_cores <- detectCores()
+doParallel::registerDoParallel(n_cores/2)
+
+grid_ctrl <-
+   control_grid(
+     verbose = T,
+      save_pred = F,
+      parallel_over = NULL,
+      save_workflow = F
+   )
+
+tic()
+set.seed(12345)
+xgb_tuned <- tune::tune_grid(
+  object = xgb_wf,
+  resamples = elsa_cv_folds,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(mae, rmse, rsq),
+  control = grid_ctrl
+)
+toc() # 540 s
+
+## Analyze Tuning Results
+### Print all metrics
+print(collect_metrics(xgb_tuned), n = 100)
+
+### Visualize hyperparameter impacts
+xgb_tuned %>%
+  collect_metrics() %>%
+  filter(.metric == "mae") %>%
+  dplyr::select(mean, mtry:stop_iter) %>%
+  pivot_longer(mtry:stop_iter,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Mean absolute error")
+
+### Select Best Hyperparameters
+xgb_best_params <- xgb_tuned %>% 
+  tune::select_best(metric = "mae")
+
+mtry_best <- xgb_best_params$mtry
+min_n_best <- xgb_best_params$min_n
+trees_best <- xgb_best_params$trees
+tree_depth_best <- xgb_best_params$tree_depth
+
+opt_hyper_elsa[opt_hyper_elsa$group == "overall", c("mtry", "trees", "min_n", "tree_depth", "learn_rate", "loss_reduction", "sample_size", "stop_iter")] <- xgb_tuned %>% tune::select_best(metric = "mae") %>% dplyr::select(mtry:stop_iter)
+
+### Calculate Cross-Validation Metrics
+mae_cv_overall <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'mae') %>%
+  pull(.estimate)
+skim(mae_cv_overall)
+
+rmse_cv_overall <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rmse') %>%
+  pull(.estimate)
+skim(rmse_cv_overall)
+
+rsq_cv_overall <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rsq') %>%
+  pull(.estimate)
+skim(rsq_cv_overall)
+
+
+## Finalize Workflow with Best Parameters
+xgb_final_wf <- 
+  xgb_wf %>% 
+  finalize_workflow(xgb_best_params)
+
+## Fit Final Model
+### Fit model on entire training data
+set.seed(12345)
+final_xgb_mod <- xgb_final_wf %>%
+  fit(data = train_preped)
+  
+train_preped %>%
+  mutate(
+    pred = predict(final_xgb_mod, new_data = train_preped, type = "raw")
+  ) %>%
+  yardstick::metrics(fi, pred) %>%
+  mutate(.estimate = format(round(.estimate, 4), big.mark = ","))
+
+test_preped %>%
+  mutate(
+    pred = predict(final_xgb_mod, new_data = test_preped, type = "raw")
+  ) %>%
+  yardstick::metrics(fi, pred) %>%
+  mutate(.estimate = format(round(.estimate, 4), big.mark = ","))
+
+
+### Bootstrap Performance Metrics on testing data
+options(boot.parallel = "no", boot.ncpus = 1)
+set.seed(12345)
+tic()
+mae_boot_xgb_overall <- boot(data = test_preped, statistic = mae_func, R = 1000, model = final_xgb_mod)
+mae_boot_xgb_overall
+boot.ci(mae_boot_xgb_overall, type = "norm", conf = 0.95)
+toc()
+
+set.seed(12345)
+tic()
+rmse_boot_xgb_overall <- boot(data = test_preped, statistic = rmse_func, R = 1000, model = final_xgb_mod)
+rmse_boot_xgb_overall
+boot.ci(rmse_boot_xgb_overall, type = "norm", conf = 0.95)
+toc()
+
+set.seed(12345)
+tic()
+rsq_boot_xgb_overall <- boot(data = test_preped, statistic = rsq_func, R = 1000, model = final_xgb_mod)
+rsq_boot_xgb_overall
+boot.ci(rsq_boot_xgb_overall, type = "norm", conf = 0.95)
+toc()
+
+```
+
+#### SHAP 
+
+```{r}
+
+# Extract model information
+xgb_fit_overall <- final_xgb_mod %>% extract_fit_engine()
+
+# Create “shapviz” object
+set.seed(12345)
+shp_overall <- shapviz(xgb_fit_overall, X_pred = data.matrix(elsa_rec %>% prep() %>% bake(new_data = NULL) %>% dplyr::select(-fi)))
+
+demo <- c("age", "male_male")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath_yes", "raccwaterc_yes", "raccwaterh_yes", "racctoilet_yes", "raccheating_yes", "difjob_intermediate", "difjob_low", "difjob_other", "rsunemp_yes", "sfnhch_yes", 
+  "dadbond", "mombond", "sepmom_yes",  "padiech_yes", "orphanage_yes", "fosterhome_yes", "ramischlth_yes", "assaultch_yes", "sexabusedch_yes", "pabused_yes", "paargue_yes", "padrug_yes", "padivch_yes"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white_white", "lbrf_others", "lbrf_retired")
+mc <- c("exrelefo_yes", "ahown_yes", "hocenh_yes", "hoadpwd_yes", "hoadprs_yes", "hoadphr_yes", "hoadpad_yes", "hoadpap_yes", "hoadpbm_yes", "hoadpkm_yes", "hoadpli_yes", "hoadpcl_yes", "hoadpal_yes", "hoprosp_yes", "hopronz_yes", "hoprosn_yes", "hoprodk_yes", "hopropo_yes", "hoprord_yes", "hoprowa_yes", "hoprocp_yes", "hoproep_yes", "hoproro_yes", "hoproin_yes", "hoproco_yes")
+socc <- c(
+  "mstat_widowed", "mstat_separated", "mstat_never", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "snegsupport", "kposupport", "knegsupport", "oposupport", "onegsupport", "fposupport", "fnegsupport", 
+  "political_yes", "tenant_yes", "church_yes", "charitable_yes", "course_yes", "club_yes", "sport_yes", 
+  "newspaper_yes", "internet_yes", "phone_yes", "holidayuk_yes", "holidayabroad_yes", "daytrip_yes", "hopet_yes",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise_yes", "lifethe_yes", "attacke_yes", "sexas_yes", "addic_yes", "combate_yes", "witwr_yes", "witkl_yes", "loswr_yes", "riskf_yes", "longcare_yes", "sfnhe_yes", "homeless_yes")
+behav <- c("smokev_yes", "smoken_yes", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv_yes", "difftogp_yes", "difftodentist_yes", "difftooptician_yes", "difftoshospital_yes", "transportdep_yes")
+
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+var_name <- c(
+  "Age",
+  "Sex: male",
+   
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation: intermediate", 
+  "Main carer's occupation: low",
+  "Main carer's occupation: other",
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+ 
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race: white",
+  "Labor force status: other",
+  "Labor force status: retired",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status: widowed", 
+  "Marital status: separated/divorced", 
+  "Marital status: never married",
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# SHAP values
+shp_imp_var_overall <- sv_importance(shp_overall, max_display = 150)$data %>%
+  as_tibble() %>%
+  mutate(
+    value_normalized = value / sum(value),
+    category = case_when(
+      feature %in% demo ~ "Demographics",
+      feature %in% ace ~ "Adverse Childhood Experiences",
+      feature %in% ses ~ "Socioeconomic Status",
+      feature %in% mc ~ "Material Circumstances",
+      feature %in% socc ~ "Social Connections",
+      feature %in% stress ~ "Social Stressors",
+      feature %in% behav ~ "Health Behaviors",
+      feature %in% hcare ~ "Healthcare Systems"
+    ),
+    category = factor(category, levels = c("Demographics", "Adverse Childhood Experiences", "Socioeconomic Status", "Material Circumstances", "Social Connections", "Social Stressors", "Health Behaviors", "Healthcare Systems")),
+    feature = factor(feature, levels = var_order)
+  ) %>%
+  arrange(category, feature) %>%
+  mutate(var_name = var_name) %>%
+  arrange(value)
+shp_imp_var_overall$var_name <- factor(shp_imp_var_overall$var_name, levels = shp_imp_var_overall$var_name)
+
+shp_imp_cate_overall <- shp_imp_var_overall %>%
+  dplyr::select(value_normalized, category) %>%
+  group_by(category) %>%
+  summarise(value_normalized = sum(value_normalized)) %>%
+  arrange(category) %>%
+  arrange(value_normalized)
+
+# Dependence plot
+S <- shp_overall[["S"]] %>% # Matrix of SHAP values
+  as_tibble() %>%
+  dplyr::select(all_of(var_order)) %>%
+  data.matrix()
+colnames(S) <- var_name
+
+X <- shp_overall[["X"]] %>% # Dataset that includes the corresponding feature values
+  dplyr::select(all_of(var_order))
+colnames(X) <- var_name
+
+shp_overall_named <- shp_overall
+shp_overall_named$S <- S
+shp_overall_named$X <- X
+
+sv_imp_overall <- sv_importance(shp_overall_named, max_display = 150)
+
+```
+
+### Environment-wide association study (EWAS)
+
+```{r}
+
+# Variable
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbathyes", "raccwatercyes", "raccwaterhyes", "racctoiletyes", "raccheatingyes", "difjobintermediate", "difjoblow", "difjobother", "rsunempyes", "sfnhchyes", 
+  "dadbond", "mombond", "sepmomyes",  "padiechyes", "orphanageyes", "fosterhomeyes", "ramischlthyes", "assaultchyes", "sexabusedchyes", "pabusedyes", "paargueyes", "padrugyes", "padivchyes"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "whitewhite", "lbrfothers", "lbrfretired")
+mc <- c("exrelefoyes", "ahownyes", "hocenhyes", "hoadpwdyes", "hoadprsyes", "hoadphryes", "hoadpadyes", "hoadpapyes", "hoadpbmyes", "hoadpkmyes", "hoadpliyes", "hoadpclyes", "hoadpalyes", "hoprospyes", "hopronzyes", "hoprosnyes", "hoprodkyes", "hopropoyes", "hoprordyes", "hoprowayes", "hoprocpyes", "hoproepyes", "hoproroyes", "hoproinyes", "hoprocoyes")
+socc <- c(
+  "mstatwidowed", "mstatseparated", "mstatnever", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "snegsupport", "kposupport", "knegsupport", "oposupport", "onegsupport", "fposupport", "fnegsupport", 
+  "politicalyes", "tenantyes", "churchyes", "charitableyes", "courseyes", "clubyes", "sportyes", 
+  "newspaperyes", "internetyes", "phoneyes", "holidayukyes", "holidayabroadyes", "daytripyes", "hopetyes",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadiseyes", "lifetheyes", "attackeyes", "sexasyes", "addicyes", "combateyes", "witwryes", "witklyes", "loswryes", "riskfyes", "longcareyes", "sfnheyes", "homelessyes")
+behav <- c("smokevyes", "smokenyes", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hiprivyes", "difftogpyes", "difftodentistyes", "difftoopticianyes", "difftoshospitalyes", "transportdepyes")
+
+# Variable information
+var_name <- c(
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation: intermediate", 
+  "Main carer's occupation: low",
+  "Main carer's occupation: other",
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+ 
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race: white",
+  "Labor force status: other",
+  "Labor force status: retired",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status: widowed", 
+  "Marital status: separated/divorced", 
+  "Marital status: never married",
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+var_mapping <- data.frame(term = c(
+  ace, ses, mc, socc, stress, behav, hcare
+), var_name = var_name)
+
+
+
+# EWAS
+train_results <- environmental_wide_association_study(train_baked) %>%
+  left_join(var_mapping, by = "term") %>%
+  mutate(
+    category = case_when(
+      term %in% ace ~ "Adverse Childhood Experiences",
+      term %in% ses ~ "Socioeconomic Status",
+      term %in% mc ~ "Material Circumstances",
+      term %in% socc ~ "Social Connections",
+      term %in% stress ~ "Social Stressors",
+      term %in% behav ~ "Health Behaviors",
+      term %in% hcare ~ "Healthcare Systems"
+    ),
+    category = factor(category, levels = c("Adverse Childhood Experiences", "Socioeconomic Status", "Material Circumstances", "Social Connections", "Social Stressors", "Health Behaviors", "Healthcare Systems")),
+    neg_log_p = -log10(p.value),
+    fdr = p.adjust(p.value, method = "BH"),
+    significant  = ifelse(fdr < 0.05, 1, 0)
+    )
+test_results <- environmental_wide_association_study(test_baked) %>%
+  left_join(var_mapping, by = "term") %>%
+  mutate(
+    category = case_when(
+      term %in% ace ~ "Adverse Childhood Experiences",
+      term %in% ses ~ "Socioeconomic Status",
+      term %in% mc ~ "Material Circumstances",
+      term %in% socc ~ "Social Connections",
+      term %in% stress ~ "Social Stressors",
+      term %in% behav ~ "Health Behaviors",
+      term %in% hcare ~ "Healthcare Systems"
+    ),
+    category = factor(category, levels = c("Adverse Childhood Experiences", "Socioeconomic Status", "Material Circumstances", "Social Connections", "Social Stressors", "Health Behaviors", "Healthcare Systems")),
+    neg_log_p = -log10(p.value),
+    fdr = NA,
+    significant  = ifelse(p.value < 0.05, 1, 0),
+    )
+
+## Significant variables in both training and testing data
+train_significant_vars <- train_results %>%
+  filter(significant == 1) %>%
+  pull(term)
+
+test_significant_vars <- test_results %>%
+  filter(significant == 1) %>%
+  pull(term)
+
+consistent_significant_vars <- intersect(train_significant_vars, test_significant_vars)
+
+train_consistent_results <- train_results %>%
+  filter(var %in% consistent_significant_vars)
+
+test_consistent_results <- test_results %>%
+  filter(var %in% consistent_significant_vars)
+
+combined_results <- full_join(
+  train_consistent_results %>% 
+    rename(train_estimate = estimate, 
+           train_std_error = std.error, 
+           train_p_value = p.value,
+           train_neg_log_p = neg_log_p,
+           train_fdr = fdr,
+           train_significant = significant),
+  test_consistent_results %>% 
+    dplyr::select(-c(var, var_name, category)) %>%
+    rename(test_estimate = estimate, 
+           test_std_error = std.error, 
+           test_p_value = p.value,
+           test_neg_log_p = neg_log_p,
+           test_fdr = fdr,
+           test_significant = significant),
+  by = "term"
+)
+
+```
+
+## Male
+
+### Data preparation
+
+```{r}
+
+# Train-test split
+data <- final %>%
+  filter(male == "male" & fi_b < 0.2) %>%
+  dplyr::select(
+    age, #male, 
+    ramomedu, radadedu, pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    difjob, rsunemp, sfnhch,
+    mombond, dadbond, sepmom, padiech, orphanage, fosterhome, ramischlth, assaultch, sexabusedch, 
+    pabused, paargue, padrug, padivch, 
+    raeducl, atotb, itot, sclddr, white, lbrf, 
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, nnsocial,
+    pdailydiscrim, loneliness,
+    nadise, lifethe, attacke, sexas, addic, combate, witwr, witkl, loswr, riskf, longcare, sfnhe, 
+    homeless,
+    smokev, smoken, drink_e, drinkwn_e, ltactx_e, mdactx_e, vgactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, difftogp, difftodentist, difftooptician, difftoshospital, transportdep, 
+    fi)
+
+set.seed(12345)
+elsa_split <- initial_split(data, prop = 0.8)
+train_elsa <- training(elsa_split)
+test_elsa  <- testing(elsa_split)
+
+# Missing value imputation
+tic()
+train_preped <- missRanger(train_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 16 s
+train_preped$fi <- train_elsa$fi
+
+tic()
+test_preped <- missRanger(test_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 11 s
+test_preped$fi <- test_elsa$fi
+# skim(test_preped)
+
+# Data baking
+train_baked <- recipe(fi ~ ., data = train_preped) %>%
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+test_baked <- recipe(fi ~ ., data = test_preped) %>% 
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+#### Save data for GA2M ####
+write.csv(train_baked, file = "train_baked_male_elsa.csv", row.names = F)
+write.csv(test_baked, file = "test_baked_male_elsa.csv", row.names = F)
+
+```
+
+### xgboost
+
+```{r}
+
+# Preprocessing and Dummy Encoding
+elsa_rec <- recipe(fi ~ ., data = train_preped) %>% 
+  step_dummy(all_factor_predictors(), one_hot = F)
+
+## Cross-Validation Setup
+set.seed(12345)
+elsa_cv_folds <- rsample::vfold_cv(train_preped, v = 10)
+
+# Model Specification and Hyperparameter Tuning
+xgb_mod <- boost_tree(
+  trees = tune(), # nrounds
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),  
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune(),
+  stop_iter = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+## Create Hyperparameter Search Grid
+set.seed(12345)
+xgb_grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(), # max_depth
+  min_n(), # min_child_weight
+  loss_reduction(), # gamma
+  sample_size = sample_prop(), # subsample
+  finalize(mtry(), train_preped), # colsample_bynode
+  learn_rate(),
+  stop_iter(),
+  size = 100
+)
+
+# Create Workflow
+xgb_wf <- 
+  workflow() %>% 
+  add_recipe(elsa_rec) %>%
+  add_model(xgb_mod) 
+
+# Parallel Computing for Hyperparameter Tuning
+n_cores <- detectCores()
+doParallel::registerDoParallel(n_cores/2)
+
+grid_ctrl <-
+   control_grid(
+     verbose = T,
+      save_pred = F,
+      parallel_over = NULL,
+      save_workflow = F
+   )
+
+tic()
+set.seed(12345)
+xgb_tuned <- tune::tune_grid(
+  object = xgb_wf,
+  resamples = elsa_cv_folds,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(mae, rmse, rsq),
+  control = grid_ctrl
+)
+toc() # 200 s
+
+## Analyze Tuning Results
+### Print all metrics
+print(collect_metrics(xgb_tuned), n = 100)
+
+### Visualize hyperparameter impacts
+xgb_tuned %>%
+  collect_metrics() %>%
+  filter(.metric == "mae") %>%
+  dplyr::select(mean, mtry:stop_iter) %>%
+  pivot_longer(mtry:stop_iter,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Mean absolute error")
+
+### Select Best Hyperparameters
+xgb_best_params <- xgb_tuned %>% 
+  tune::select_best(metric = "mae")
+
+mtry_best <- xgb_best_params$mtry
+min_n_best <- xgb_best_params$min_n
+trees_best <- xgb_best_params$trees
+tree_depth_best <- xgb_best_params$tree_depth
+
+opt_hyper_elsa[opt_hyper_elsa$group == "male", c("mtry", "trees", "min_n", "tree_depth", "learn_rate", "loss_reduction", "sample_size", "stop_iter")] <- xgb_tuned %>% tune::select_best(metric = "mae") %>% dplyr::select(mtry:stop_iter)
+
+### Calculate Cross-Validation Metrics
+mae_cv_male <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'mae') %>%
+  pull(.estimate)
+skim(mae_cv_male)
+
+rmse_cv_male <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rmse') %>%
+  pull(.estimate)
+skim(rmse_cv_male)
+
+rsq_cv_male <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rsq') %>%
+  pull(.estimate)
+skim(rsq_cv_male)
+
+## Finalize Workflow with Best Parameters
+xgb_final_wf <- 
+  xgb_wf %>% 
+  finalize_workflow(xgb_best_params)
+
+## Fit Final Model
+### Fit model on entire training data
+set.seed(12345)
+final_xgb_mod <- xgb_final_wf %>%
+  fit(data = train_preped)
+  
+### Bootstrap Performance Metrics on testing data
+options(boot.parallel = "no", boot.ncpus = 1)
+set.seed(12345)
+tic()
+mae_boot_xgb_male <- boot(data = test_preped, statistic = mae_func, R = 1000, model = final_xgb_mod)
+print(mae_boot_xgb_male)
+toc()
+
+set.seed(12345)
+tic()
+rmse_boot_xgb_male <- boot(data = test_preped, statistic = rmse_func, R = 1000, model = final_xgb_mod)
+print(rmse_boot_xgb_male)
+toc()
+
+set.seed(12345)
+tic()
+rsq_boot_xgb_male <- boot(data = test_preped, statistic = rsq_func, R = 1000, model = final_xgb_mod)
+print(rsq_boot_xgb_male)
+toc()
+
+```
+
+#### SHAP 
+
+```{r}
+
+# Extract model information
+xgb_fit_male <- final_xgb_mod %>% extract_fit_engine()
+
+# Create “shapviz” object
+set.seed(12345)
+shp_male <- shapviz(xgb_fit_male, X_pred = data.matrix(elsa_rec %>% prep() %>% bake(new_data = NULL) %>% dplyr::select(-fi)))
+
+demo <- c("age")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath_yes", "raccwaterc_yes", "raccwaterh_yes", "racctoilet_yes", "raccheating_yes", "difjob_intermediate", "difjob_low", "difjob_other", "rsunemp_yes", "sfnhch_yes", 
+  "dadbond", "mombond", "sepmom_yes",  "padiech_yes", "orphanage_yes", "fosterhome_yes", "ramischlth_yes", "assaultch_yes", "sexabusedch_yes", "pabused_yes", "paargue_yes", "padrug_yes", "padivch_yes"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white_white", "lbrf_others", "lbrf_retired")
+mc <- c("exrelefo_yes", "ahown_yes", "hocenh_yes", "hoadpwd_yes", "hoadprs_yes", "hoadphr_yes", "hoadpad_yes", "hoadpap_yes", "hoadpbm_yes", "hoadpkm_yes", "hoadpli_yes", "hoadpcl_yes", "hoadpal_yes", "hoprosp_yes", "hopronz_yes", "hoprosn_yes", "hoprodk_yes", "hopropo_yes", "hoprord_yes", "hoprowa_yes", "hoprocp_yes", "hoproep_yes", "hoproro_yes", "hoproin_yes", "hoproco_yes")
+socc <- c(
+  "mstat_widowed", "mstat_separated", "mstat_never", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "snegsupport", "kposupport", "knegsupport", "oposupport", "onegsupport", "fposupport", "fnegsupport", 
+  "political_yes", "tenant_yes", "church_yes", "charitable_yes", "course_yes", "club_yes", "sport_yes", 
+  "newspaper_yes", "internet_yes", "phone_yes", "holidayuk_yes", "holidayabroad_yes", "daytrip_yes", "hopet_yes",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise_yes", "lifethe_yes", "attacke_yes", "sexas_yes", "addic_yes", "combate_yes", "witwr_yes", "witkl_yes", "loswr_yes", "riskf_yes", "longcare_yes", "sfnhe_yes", "homeless_yes")
+behav <- c("smokev_yes", "smoken_yes", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv_yes", "difftogp_yes", "difftodentist_yes", "difftooptician_yes", "difftoshospital_yes", "transportdep_yes")
+
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+var_name <- c(
+  "Age",
+
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation: intermediate", 
+  "Main carer's occupation: low",
+  "Main carer's occupation: other",
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+ 
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race: white",
+  "Labor force status: other",
+  "Labor force status: retired",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status: widowed", 
+  "Marital status: separated/divorced", 
+  "Marital status: never married",
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# SHAP values
+shp_imp_var_male <- sv_importance(shp_male, max_display = 150)$data %>%
+  as_tibble() %>%
+  mutate(
+    value_normalized = value / sum(value),
+    category = case_when(
+      feature %in% demo ~ "Demographics",
+      feature %in% ace ~ "Adverse Childhood Experiences",
+      feature %in% ses ~ "Socioeconomic Status",
+      feature %in% mc ~ "Material Circumstances",
+      feature %in% socc ~ "Social Connections",
+      feature %in% stress ~ "Social Stressors",
+      feature %in% behav ~ "Health Behaviors",
+      feature %in% hcare ~ "Healthcare Systems"
+    ),
+    category = factor(category, levels = c("Demographics", "Adverse Childhood Experiences", "Socioeconomic Status", "Material Circumstances", "Social Connections", "Social Stressors", "Health Behaviors", "Healthcare Systems")),
+    feature = factor(feature, levels = var_order)
+  ) %>%
+  arrange(category, feature) %>%
+  mutate(var_name = var_name) %>%
+  arrange(value)
+shp_imp_var_male$var_name <- factor(shp_imp_var_male$var_name, levels = shp_imp_var_male$var_name)
+
+shp_imp_cate_male <- shp_imp_var_male %>%
+  dplyr::select(value_normalized, category) %>%
+  group_by(category) %>%
+  summarise(value_normalized = sum(value_normalized)) %>%
+  arrange(category) %>%
+  arrange(value_normalized)
+
+# Dependence plot
+S <- shp_male[["S"]] %>% # Matrix of SHAP values
+  as_tibble() %>%
+  dplyr::select(all_of(var_order)) %>%
+  data.matrix()
+colnames(S) <- var_name
+
+X <- shp_male[["X"]] %>% # Dataset that includes the corresponding feature values
+  dplyr::select(all_of(var_order))
+colnames(X) <- var_name
+
+shp_male_named <- shp_male
+shp_male_named$S <- S
+shp_male_named$X <- X
+
+sv_imp_male <- sv_importance(shp_male_named, max_display = 150)
+
+```
+
+## Female
+
+### Data preparation
+
+```{r}
+
+# Train-test split
+data <- final %>%
+  filter(male == "female" & fi_b < 0.2) %>%
+  dplyr::select(
+    age, #male, 
+    ramomedu, radadedu, pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    difjob, rsunemp, sfnhch,
+    mombond, dadbond, sepmom, padiech, orphanage, fosterhome, ramischlth, assaultch, sexabusedch, 
+    pabused, paargue, padrug, padivch, 
+    raeducl, atotb, itot, sclddr, white, lbrf, 
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, nnsocial,
+    pdailydiscrim, loneliness,
+    nadise, lifethe, attacke, sexas, addic, combate, witwr, witkl, loswr, riskf, longcare, sfnhe, 
+    homeless,
+    smokev, smoken, drink_e, drinkwn_e, ltactx_e, mdactx_e, vgactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, difftogp, difftodentist, difftooptician, difftoshospital, transportdep, 
+    fi)
+
+set.seed(12345)
+elsa_split <- initial_split(data, prop = 0.8)
+train_elsa <- training(elsa_split)
+test_elsa  <- testing(elsa_split)
+
+# Missing value imputation
+tic()
+train_preped <- missRanger(train_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 16 s
+train_preped$fi <- train_elsa$fi
+
+tic()
+test_preped <- missRanger(test_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 11 s
+test_preped$fi <- test_elsa$fi
+# skim(test_preped)
+
+# Data baking
+train_baked <- recipe(fi ~ ., data = train_preped) %>%
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+test_baked <- recipe(fi ~ ., data = test_preped) %>% 
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+#### Save data for GA2M ####
+write.csv(train_baked, file = "train_baked_female_elsa.csv", row.names = F)
+write.csv(test_baked, file = "test_baked_female_elsa.csv", row.names = F)
+
+```
+
+### xgboost
+
+```{r}
+
+# Preprocessing and Dummy Encoding
+elsa_rec <- recipe(fi ~ ., data = train_preped) %>%
+  step_dummy(all_factor_predictors(), one_hot = F)
+
+## Cross-Validation Setup
+set.seed(12345)
+elsa_cv_folds <- rsample::vfold_cv(train_preped, v = 10)
+
+# Model Specification and Hyperparameter Tuning
+xgb_mod <- boost_tree(
+  trees = tune(), # nrounds
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),  
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune(),
+  stop_iter = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+## Create Hyperparameter Search Grid
+set.seed(12345)
+xgb_grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(), # max_depth
+  min_n(), # min_child_weight
+  loss_reduction(), # gamma
+  sample_size = sample_prop(), # subsample
+  finalize(mtry(), train_preped), # colsample_bynode
+  learn_rate(),
+  stop_iter(),
+  size = 100
+)
+
+# Create Workflow
+xgb_wf <- 
+  workflow() %>% 
+  add_recipe(elsa_rec) %>%
+  add_model(xgb_mod) 
+
+# Parallel Computing for Hyperparameter Tuning
+n_cores <- detectCores()
+doParallel::registerDoParallel(n_cores/2)
+
+grid_ctrl <-
+   control_grid(
+     verbose = T,
+      save_pred = F,
+      parallel_over = NULL,
+      save_workflow = F
+   )
+
+tic()
+set.seed(12345)
+xgb_tuned <- tune::tune_grid(
+  object = xgb_wf,
+  resamples = elsa_cv_folds,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(mae, rmse, rsq),
+  control = grid_ctrl
+)
+toc() # 200 s
+
+## Analyze Tuning Results
+### Print all metrics
+print(collect_metrics(xgb_tuned), n = 100)
+
+### Visualize hyperparameter impacts
+xgb_tuned %>%
+  collect_metrics() %>%
+  filter(.metric == "mae") %>%
+  dplyr::select(mean, mtry:stop_iter) %>%
+  pivot_longer(mtry:stop_iter,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Mean absolute error")
+
+### Select Best Hyperparameters
+xgb_best_params <- xgb_tuned %>% 
+  tune::select_best(metric = "mae")
+
+xgb_tuned %>% 
+  tune::select_best(metric = "mae")
+
+mtry_best <- xgb_best_params$mtry
+min_n_best <- xgb_best_params$min_n
+trees_best <- xgb_best_params$trees
+tree_depth_best <- xgb_best_params$tree_depth
+
+opt_hyper_elsa[opt_hyper_elsa$group == "female", c("mtry", "trees", "min_n", "tree_depth", "learn_rate", "loss_reduction", "sample_size", "stop_iter")] <- xgb_tuned %>% tune::select_best(metric = "mae") %>% dplyr::select(mtry:stop_iter)
+
+### Calculate Cross-Validation Metrics
+mae_cv_female <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'mae') %>%
+  pull(.estimate)
+skim(mae_cv_female)
+
+rmse_cv_female <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rmse') %>%
+  pull(.estimate)
+skim(rmse_cv_female)
+
+rsq_cv_female <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rsq') %>%
+  pull(.estimate)
+skim(rsq_cv_female)
+
+
+## Finalize Workflow with Best Parameters
+xgb_final_wf <- 
+  xgb_wf %>% 
+  finalize_workflow(xgb_best_params)
+
+## Fit Final Model
+### Fit model on entire training data
+set.seed(12345)
+final_xgb_mod <- xgb_final_wf %>%
+  fit(data = train_preped)
+
+### Bootstrap Performance Metrics on testing data
+options(boot.parallel = "no", boot.ncpus = 1)
+set.seed(12345)
+tic()
+mae_boot_xgb_female <- boot(data = test_preped, statistic = mae_func, R = 1000, model = final_xgb_mod)
+print(mae_boot_xgb_female)
+toc()
+
+set.seed(12345)
+tic()
+rmse_boot_xgb_female <- boot(data = test_preped, statistic = rmse_func, R = 1000, model = final_xgb_mod)
+print(rmse_boot_xgb_female)
+toc()
+
+set.seed(12345)
+tic()
+rsq_boot_xgb_female <- boot(data = test_preped, statistic = rsq_func, R = 1000, model = final_xgb_mod)
+print(rsq_boot_xgb_female)
+toc()
+
+```
+
+#### SHAP 
+
+```{r}
+
+# Extract model information
+xgb_fit_female <- final_xgb_mod %>% extract_fit_engine()
+
+# Create “shapviz” object
+set.seed(12345)
+shp_female <- shapviz(xgb_fit_female, X_pred = data.matrix(elsa_rec %>% prep() %>% bake(new_data = NULL) %>% dplyr::select(-fi)))
+
+demo <- c("age")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath_yes", "raccwaterc_yes", "raccwaterh_yes", "racctoilet_yes", "raccheating_yes", "difjob_intermediate", "difjob_low", "difjob_other", "rsunemp_yes", "sfnhch_yes", 
+  "dadbond", "mombond", "sepmom_yes",  "padiech_yes", "orphanage_yes", "fosterhome_yes", "ramischlth_yes", "assaultch_yes", "sexabusedch_yes", "pabused_yes", "paargue_yes", "padrug_yes", "padivch_yes"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white_white", "lbrf_others", "lbrf_retired")
+mc <- c("exrelefo_yes", "ahown_yes", "hocenh_yes", "hoadpwd_yes", "hoadprs_yes", "hoadphr_yes", "hoadpad_yes", "hoadpap_yes", "hoadpbm_yes", "hoadpkm_yes", "hoadpli_yes", "hoadpcl_yes", "hoadpal_yes", "hoprosp_yes", "hopronz_yes", "hoprosn_yes", "hoprodk_yes", "hopropo_yes", "hoprord_yes", "hoprowa_yes", "hoprocp_yes", "hoproep_yes", "hoproro_yes", "hoproin_yes", "hoproco_yes")
+socc <- c(
+  "mstat_widowed", "mstat_separated", "mstat_never", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "snegsupport", "kposupport", "knegsupport", "oposupport", "onegsupport", "fposupport", "fnegsupport", 
+  "political_yes", "tenant_yes", "church_yes", "charitable_yes", "course_yes", "club_yes", "sport_yes", 
+  "newspaper_yes", "internet_yes", "phone_yes", "holidayuk_yes", "holidayabroad_yes", "daytrip_yes", "hopet_yes",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise_yes", "lifethe_yes", "attacke_yes", "sexas_yes", "addic_yes", "combate_yes", "witwr_yes", "witkl_yes", "loswr_yes", "riskf_yes", "longcare_yes", "sfnhe_yes", "homeless_yes")
+behav <- c("smokev_yes", "smoken_yes", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv_yes", "difftogp_yes", "difftodentist_yes", "difftooptician_yes", "difftoshospital_yes", "transportdep_yes")
+
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+var_name <- c(
+  "Age",
+
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation: intermediate", 
+  "Main carer's occupation: low",
+  "Main carer's occupation: other",
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+ 
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race: white",
+  "Labor force status: other",
+  "Labor force status: retired",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status: widowed", 
+  "Marital status: separated/divorced", 
+  "Marital status: never married",
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+
+# SHAP values
+shp_imp_var_female <- sv_importance(shp_female, max_display = 150)$data %>%
+  as_tibble() %>%
+  mutate(
+    value_normalized = value / sum(value),
+    category = case_when(
+      feature %in% demo ~ "Demographics",
+      feature %in% ace ~ "Adverse Childhood Experiences",
+      feature %in% ses ~ "Socioeconomic Status",
+      feature %in% mc ~ "Material Circumstances",
+      feature %in% socc ~ "Social Connections",
+      feature %in% stress ~ "Social Stressors",
+      feature %in% behav ~ "Health Behaviors",
+      feature %in% hcare ~ "Healthcare Systems"
+    ),
+    category = factor(category, levels = c("Demographics", "Adverse Childhood Experiences", "Socioeconomic Status", "Material Circumstances", "Social Connections", "Social Stressors", "Health Behaviors", "Healthcare Systems")),
+    feature = factor(feature, levels = var_order)
+  ) %>%
+  arrange(category, feature) %>%
+  mutate(var_name = var_name) %>%
+  arrange(value)
+shp_imp_var_female$var_name <- factor(shp_imp_var_female$var_name, levels = shp_imp_var_female$var_name)
+
+shp_imp_cate_female <- shp_imp_var_female %>%
+  dplyr::select(value_normalized, category) %>%
+  group_by(category) %>%
+  summarise(value_normalized = sum(value_normalized)) %>%
+  arrange(category) %>%
+  arrange(value_normalized)
+
+# Dependence plot
+S <- shp_female[["S"]] %>% # Matrix of SHAP values
+  as_tibble() %>%
+  dplyr::select(all_of(var_order)) %>%
+  data.matrix()
+colnames(S) <- var_name
+
+X <- shp_female[["X"]] %>% # Dataset that includes the corresponding feature values
+  dplyr::select(all_of(var_order))
+colnames(X) <- var_name
+
+shp_female_named <- shp_female
+shp_female_named$S <- S
+shp_female_named$X <- X
+
+sv_imp_female <- sv_importance(shp_female_named, max_display = 150)
+
+```
+
+## 50-64
+
+### Data preparation
+
+```{r}
+
+# Train-test split
+data <- final %>%
+  filter(age < 65 & fi_b < 0.2) %>%
+  dplyr::select(
+    age, male, 
+    ramomedu, radadedu, pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    difjob, rsunemp, sfnhch,
+    mombond, dadbond, sepmom, padiech, orphanage, fosterhome, ramischlth, assaultch, sexabusedch, 
+    pabused, paargue, padrug, padivch, 
+    raeducl, atotb, itot, sclddr, white, lbrf, 
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, nnsocial,
+    pdailydiscrim, loneliness,
+    nadise, lifethe, attacke, sexas, addic, combate, witwr, witkl, loswr, riskf, longcare, sfnhe, 
+    homeless,
+    smokev, smoken, drink_e, drinkwn_e, ltactx_e, mdactx_e, vgactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, difftogp, difftodentist, difftooptician, difftoshospital, transportdep, 
+    fi)
+
+set.seed(12345)
+elsa_split <- initial_split(data, prop = 0.8)
+train_elsa <- training(elsa_split)
+test_elsa  <- testing(elsa_split)
+
+# Missing value imputation
+tic()
+train_preped <- missRanger(train_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 16 s
+train_preped$fi <- train_elsa$fi
+
+tic()
+test_preped <- missRanger(test_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 11 s
+test_preped$fi <- test_elsa$fi
+# skim(test_preped)
+
+# Data baking
+train_baked <- recipe(fi ~ ., data = train_preped) %>% 
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+test_baked <- recipe(fi ~ ., data = test_preped) %>% 
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+#### Save data for GA2M ####
+write.csv(train_baked, file = "train_baked_5064_elsa.csv", row.names = F)
+write.csv(test_baked, file = "test_baked_5064_elsa.csv", row.names = F)
+
+```
+
+### xgboost
+
+```{r}
+
+# Preprocessing and Dummy Encoding
+elsa_rec <- recipe(fi ~ ., data = train_preped) %>%
+  step_dummy(all_factor_predictors(), one_hot = F)
+
+## Cross-Validation Setup
+set.seed(12345)
+elsa_cv_folds <- rsample::vfold_cv(train_preped, v = 10)
+
+# Model Specification and Hyperparameter Tuning
+xgb_mod <- boost_tree(
+  trees = tune(), # nrounds
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),  
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune(),
+  stop_iter = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+## Create Hyperparameter Search Grid
+set.seed(12345)
+xgb_grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(), # max_depth
+  min_n(), # min_child_weight
+  loss_reduction(), # gamma
+  sample_size = sample_prop(), # subsample
+  finalize(mtry(), train_preped), # colsample_bynode
+  learn_rate(),
+  stop_iter(),
+  size = 100
+)
+
+# Create Workflow
+xgb_wf <- 
+  workflow() %>% 
+  add_recipe(elsa_rec) %>%
+  add_model(xgb_mod) 
+
+# Parallel Computing for Hyperparameter Tuning
+n_cores <- detectCores()
+doParallel::registerDoParallel(n_cores/2)
+
+grid_ctrl <-
+   control_grid(
+     verbose = T,
+      save_pred = F,
+      parallel_over = NULL,
+      save_workflow = F
+   )
+
+tic()
+set.seed(12345)
+xgb_tuned <- tune::tune_grid(
+  object = xgb_wf,
+  resamples = elsa_cv_folds,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(mae, rmse, rsq),
+  control = grid_ctrl
+)
+toc() # 200 s
+
+## Analyze Tuning Results
+### Print all metrics
+print(collect_metrics(xgb_tuned), n = 100)
+
+### Visualize hyperparameter impacts
+xgb_tuned %>%
+  collect_metrics() %>%
+  filter(.metric == "mae") %>%
+  dplyr::select(mean, mtry:stop_iter) %>%
+  pivot_longer(mtry:stop_iter,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Mean absolute error")
+
+### Select Best Hyperparameters
+xgb_best_params <- xgb_tuned %>% 
+  tune::select_best(metric = "mae")
+
+xgb_tuned %>% 
+  tune::select_best(metric = "mae")
+
+mtry_best <- xgb_best_params$mtry
+min_n_best <- xgb_best_params$min_n
+trees_best <- xgb_best_params$trees
+tree_depth_best <- xgb_best_params$tree_depth
+
+opt_hyper_elsa[opt_hyper_elsa$group == "<65 years", c("mtry", "trees", "min_n", "tree_depth", "learn_rate", "loss_reduction", "sample_size", "stop_iter")] <- xgb_tuned %>% tune::select_best(metric = "mae") %>% dplyr::select(mtry:stop_iter)
+
+### Calculate Cross-Validation Metrics
+mae_cv_5064 <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'mae') %>%
+  pull(.estimate)
+skim(mae_cv_5064)
+
+rmse_cv_5064 <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rmse') %>%
+  pull(.estimate)
+skim(rmse_cv_5064)
+
+rsq_cv_5064 <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rsq') %>%
+  pull(.estimate)
+skim(rsq_cv_5064)
+
+## Finalize Workflow with Best Parameters
+xgb_final_wf <- 
+  xgb_wf %>% 
+  finalize_workflow(xgb_best_params)
+
+## Fit Final Model
+### Fit model on entire training data
+set.seed(12345)
+final_xgb_mod <- xgb_final_wf %>%
+  fit(data = train_preped)
+  
+### Bootstrap Performance Metrics on testing data
+options(boot.parallel = "no", boot.ncpus = 1)
+set.seed(12345)
+tic()
+mae_boot_xgb_5064 <- boot(data = test_preped, statistic = mae_func, R = 1000, model = final_xgb_mod)
+print(mae_boot_xgb_5064)
+toc()
+
+set.seed(12345)
+tic()
+rmse_boot_xgb_5064 <- boot(data = test_preped, statistic = rmse_func, R = 1000, model = final_xgb_mod)
+print(rmse_boot_xgb_5064)
+toc()
+
+set.seed(12345)
+tic()
+rsq_boot_xgb_5064 <- boot(data = test_preped, statistic = rsq_func, R = 1000, model = final_xgb_mod)
+print(rsq_boot_xgb_5064)
+toc()
+
+```
+
+#### SHAP 
+
+```{r}
+
+# Extract model information
+xgb_fit_5064 <- final_xgb_mod %>% extract_fit_engine()
+
+# Create “shapviz” object
+set.seed(12345)
+shp_5064 <- shapviz(xgb_fit_5064, X_pred = data.matrix(elsa_rec %>% prep() %>% bake(new_data = NULL) %>% dplyr::select(-fi)))
+
+demo <- c("age", "male_male")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath_yes", "raccwaterc_yes", "raccwaterh_yes", "racctoilet_yes", "raccheating_yes", "difjob_intermediate", "difjob_low", "difjob_other", "rsunemp_yes", "sfnhch_yes", 
+  "dadbond", "mombond", "sepmom_yes",  "padiech_yes", "orphanage_yes", "fosterhome_yes", "ramischlth_yes", "assaultch_yes", "sexabusedch_yes", "pabused_yes", "paargue_yes", "padrug_yes", "padivch_yes"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white_white", "lbrf_others", "lbrf_retired")
+mc <- c("exrelefo_yes", "ahown_yes", "hocenh_yes", "hoadpwd_yes", "hoadprs_yes", "hoadphr_yes", "hoadpad_yes", "hoadpap_yes", "hoadpbm_yes", "hoadpkm_yes", "hoadpli_yes", "hoadpcl_yes", "hoadpal_yes", "hoprosp_yes", "hopronz_yes", "hoprosn_yes", "hoprodk_yes", "hopropo_yes", "hoprord_yes", "hoprowa_yes", "hoprocp_yes", "hoproep_yes", "hoproro_yes", "hoproin_yes", "hoproco_yes")
+socc <- c(
+  "mstat_widowed", "mstat_separated", "mstat_never", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "snegsupport", "kposupport", "knegsupport", "oposupport", "onegsupport", "fposupport", "fnegsupport", 
+  "political_yes", "tenant_yes", "church_yes", "charitable_yes", "course_yes", "club_yes", "sport_yes", 
+  "newspaper_yes", "internet_yes", "phone_yes", "holidayuk_yes", "holidayabroad_yes", "daytrip_yes", "hopet_yes",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise_yes", "lifethe_yes", "attacke_yes", "sexas_yes", "addic_yes", "combate_yes", "witwr_yes", "witkl_yes", "loswr_yes", "riskf_yes", "longcare_yes", "sfnhe_yes", "homeless_yes")
+behav <- c("smokev_yes", "smoken_yes", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv_yes", "difftogp_yes", "difftodentist_yes", "difftooptician_yes", "difftoshospital_yes", "transportdep_yes")
+
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+var_name <- c(
+  "Age",
+  "Sex: male",
+   
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation: intermediate", 
+  "Main carer's occupation: low",
+  "Main carer's occupation: other",
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+ 
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race: white",
+  "Labor force status: other",
+  "Labor force status: retired",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status: widowed", 
+  "Marital status: separated/divorced", 
+  "Marital status: never married",
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# SHAP values
+shp_imp_var_5064 <- sv_importance(shp_5064, max_display = 150)$data %>%
+  as_tibble() %>%
+  mutate(
+    value_normalized = value / sum(value),
+    category = case_when(
+      feature %in% demo ~ "Demographics",
+      feature %in% ace ~ "Adverse Childhood Experiences",
+      feature %in% ses ~ "Socioeconomic Status",
+      feature %in% mc ~ "Material Circumstances",
+      feature %in% socc ~ "Social Connections",
+      feature %in% stress ~ "Social Stressors",
+      feature %in% behav ~ "Health Behaviors",
+      feature %in% hcare ~ "Healthcare Systems"
+    ),
+    category = factor(category, levels = c("Demographics", "Adverse Childhood Experiences", "Socioeconomic Status", "Material Circumstances", "Social Connections", "Social Stressors", "Health Behaviors", "Healthcare Systems")),
+    feature = factor(feature, levels = var_order)
+  ) %>%
+  arrange(category, feature) %>%
+  mutate(var_name = var_name) %>%
+  arrange(value)
+shp_imp_var_5064$var_name <- factor(shp_imp_var_5064$var_name, levels = shp_imp_var_5064$var_name)
+
+shp_imp_cate_5064 <- shp_imp_var_5064 %>%
+  dplyr::select(value_normalized, category) %>%
+  group_by(category) %>%
+  summarise(value_normalized = sum(value_normalized)) %>%
+  arrange(category) %>%
+  arrange(value_normalized)
+
+# Dependence plot
+S <- shp_5064[["S"]] %>% # Matrix of SHAP values
+  as_tibble() %>%
+  dplyr::select(all_of(var_order)) %>%
+  data.matrix()
+colnames(S) <- var_name
+
+X <- shp_5064[["X"]] %>% # Dataset that includes the corresponding feature values
+  dplyr::select(all_of(var_order))
+colnames(X) <- var_name
+
+shp_5064_named <- shp_5064
+shp_5064_named$S <- S
+shp_5064_named$X <- X
+
+sv_imp_5064 <- sv_importance(shp_5064_named, max_display = 150)
+
+```
+
+## 65+
+
+### Data preparation
+
+```{r}
+
+# Train-test split
+data <- final %>%
+  filter(age >= 65 & fi_b < 0.2) %>%
+  dplyr::select(
+    age, male, 
+    ramomedu, radadedu, pproom, raccbooks, raccbath, raccwaterc, raccwaterh, racctoilet, raccheating,
+    difjob, rsunemp, sfnhch,
+    mombond, dadbond, sepmom, padiech, orphanage, fosterhome, ramischlth, assaultch, sexabusedch, 
+    pabused, paargue, padrug, padivch, 
+    raeducl, atotb, itot, sclddr, white, lbrf, 
+    exrelefo, ahown, hocenh, 
+    hoadpwd, hoadprs, hoadphr, hoadpad, hoadpap, hoadpbm, 
+    hoadpkm, hoadpli, hoadpcl, hoadpal,
+    hoprosp, hopronz, hoprosn, hoprodk, hopropo, 
+    hoprord, hoprowa, hoprocp, hoproep, hoproro, hoproin, hoproco,
+    mstat, hhres, cchild, csib, cfriend, chldcontact, sibcontact, friendcontact, 
+    sposupport, kposupport, oposupport, fposupport,      
+    snegsupport, knegsupport, onegsupport, fnegsupport, 
+    political, tenant, church, charitable, course, club, sport, 
+    newspaper, internet, phone, holidayuk, holidayabroad, daytrip, hopet,
+    volunteer, cinema, art, theater, tvtime, nnsocial,
+    pdailydiscrim, loneliness,
+    nadise, lifethe, attacke, sexas, addic, combate, witwr, witkl, loswr, riskf, longcare, sfnhe, 
+    homeless,
+    smokev, smoken, drink_e, drinkwn_e, ltactx_e, mdactx_e, vgactx_e, mbmi, sleeph, sleep, vegetable, fruit,
+    hipriv, difftogp, difftodentist, difftooptician, difftoshospital, transportdep, 
+    fi)
+
+set.seed(12345)
+elsa_split <- initial_split(data, prop = 0.8)
+train_elsa <- training(elsa_split)
+test_elsa  <- testing(elsa_split)
+
+# Missing value imputation
+tic()
+train_preped <- missRanger(train_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 16 s
+train_preped$fi <- train_elsa$fi
+
+tic()
+test_preped <- missRanger(test_elsa %>% dplyr::select(!fi), . ~ ., pmm.k = 5, maxiter = 10, num.trees = 100, returnOOB = T, verbose = 1, seed = 12345)
+toc() # 11 s
+test_preped$fi <- test_elsa$fi
+# skim(test_preped)
+
+# Data baking
+train_baked <- recipe(fi ~ ., data = train_preped) %>% 
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+test_baked <- recipe(fi ~ ., data = test_preped) %>%
+  prep() %>%
+  bake(new_data = NULL) %>%
+  dplyr::select(!fi, fi)
+
+#### Save data for GA2M ####
+write.csv(train_baked, file = "train_baked_65plus_elsa.csv", row.names = F)
+write.csv(test_baked, file = "test_baked_65plus_elsa.csv", row.names = F)
+
+```
+
+### xgboost
+
+```{r}
+
+# Preprocessing and Dummy Encoding
+elsa_rec <- recipe(fi ~ ., data = train_preped) %>%
+  step_dummy(all_factor_predictors(), one_hot = F)
+
+## Cross-Validation Setup
+set.seed(12345)
+elsa_cv_folds <- rsample::vfold_cv(train_preped, v = 10)
+
+# Model Specification and Hyperparameter Tuning
+xgb_mod <- boost_tree(
+  trees = tune(), # nrounds
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),  
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune(),
+  stop_iter = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror") %>%
+  set_mode("regression")
+
+## Create Hyperparameter Search Grid
+set.seed(12345)
+xgb_grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(), # max_depth
+  min_n(), # min_child_weight
+  loss_reduction(), # gamma
+  sample_size = sample_prop(), # subsample
+  finalize(mtry(), train_preped), # colsample_bynode
+  learn_rate(),
+  stop_iter(),
+  size = 100
+)
+
+# Create Workflow
+xgb_wf <- 
+  workflow() %>% 
+  add_recipe(elsa_rec) %>%
+  add_model(xgb_mod) 
+
+# Parallel Computing for Hyperparameter Tuning
+n_cores <- detectCores()
+doParallel::registerDoParallel(n_cores/2)
+
+grid_ctrl <-
+   control_grid(
+     verbose = T,
+      save_pred = F,
+      parallel_over = NULL,
+      save_workflow = F
+   )
+
+tic()
+set.seed(12345)
+xgb_tuned <- tune::tune_grid(
+  object = xgb_wf,
+  resamples = elsa_cv_folds,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(mae, rmse, rsq),
+  control = grid_ctrl
+)
+toc() # 200 s
+
+## Analyze Tuning Results
+### Print all metrics
+print(collect_metrics(xgb_tuned), n = 100)
+
+### Visualize hyperparameter impacts
+xgb_tuned %>%
+  collect_metrics() %>%
+  filter(.metric == "mae") %>%
+  dplyr::select(mean, mtry:stop_iter) %>%
+  pivot_longer(mtry:stop_iter,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "Mean absolute error")
+
+### Select Best Hyperparameters
+xgb_best_params <- xgb_tuned %>% 
+  tune::select_best(metric = "mae")
+
+mtry_best <- xgb_best_params$mtry
+min_n_best <- xgb_best_params$min_n
+trees_best <- xgb_best_params$trees
+tree_depth_best <- xgb_best_params$tree_depth
+
+opt_hyper_elsa[opt_hyper_elsa$group == "≥65 years", c("mtry", "trees", "min_n", "tree_depth", "learn_rate", "loss_reduction", "sample_size", "stop_iter")] <- xgb_tuned %>% tune::select_best(metric = "mae") %>% dplyr::select(mtry:stop_iter)
+
+### Calculate Cross-Validation Metrics
+mae_cv_65plus <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'mae') %>%
+  pull(.estimate)
+skim(mae_cv_65plus)
+
+rmse_cv_65plus <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rmse') %>%
+  pull(.estimate)
+skim(rmse_cv_65plus)
+
+rsq_cv_65plus <- xgb_tuned %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(mtry == mtry_best & min_n == min_n_best & trees == trees_best & tree_depth == tree_depth_best) %>%
+  filter(.metric == 'rsq') %>%
+  pull(.estimate)
+skim(rsq_cv_65plus)
+
+## Finalize Workflow with Best Parameters
+xgb_final_wf <- 
+  xgb_wf %>% 
+  finalize_workflow(xgb_best_params)
+
+## Fit Final Model
+### Fit model on entire training data
+set.seed(12345)
+final_xgb_mod <- xgb_final_wf %>%
+  fit(data = train_preped)
+  
+### Bootstrap Performance Metrics on testing data
+options(boot.parallel = "no", boot.ncpus = 1)
+set.seed(12345)
+tic()
+mae_boot_xgb_65plus <- boot(data = test_preped, statistic = mae_func, R = 1000, model = final_xgb_mod)
+print(mae_boot_xgb_65plus)
+toc()
+
+set.seed(12345)
+tic()
+rmse_boot_xgb_65plus <- boot(data = test_preped, statistic = rmse_func, R = 1000, model = final_xgb_mod)
+print(rmse_boot_xgb_65plus)
+toc()
+
+set.seed(12345)
+tic()
+rsq_boot_xgb_65plus <- boot(data = test_preped, statistic = rsq_func, R = 1000, model = final_xgb_mod)
+print(rsq_boot_xgb_65plus)
+toc()
+
+```
+
+#### SHAP 
+
+```{r}
+
+# Extract model information
+xgb_fit_65plus <- final_xgb_mod %>% extract_fit_engine()
+
+# Create “shapviz” object
+set.seed(12345)
+shp_65plus <- shapviz(xgb_fit_65plus, X_pred = data.matrix(elsa_rec %>% prep() %>% bake(new_data = NULL) %>% dplyr::select(-fi)))
+
+demo <- c("age", "male_male")
+ace <- c(
+  "radadedu", "ramomedu", "pproom", "raccbooks", "raccbath_yes", "raccwaterc_yes", "raccwaterh_yes", "racctoilet_yes", "raccheating_yes", "difjob_intermediate", "difjob_low", "difjob_other", "rsunemp_yes", "sfnhch_yes", 
+  "dadbond", "mombond", "sepmom_yes",  "padiech_yes", "orphanage_yes", "fosterhome_yes", "ramischlth_yes", "assaultch_yes", "sexabusedch_yes", "pabused_yes", "paargue_yes", "padrug_yes", "padivch_yes"
+  )
+ses <- c("raeducl", "atotb", "itot", "sclddr", "white_white", "lbrf_others", "lbrf_retired")
+# mc <- c("exrelefo_yes", "ahown_yes", "hoproblem6_yes")
+mc <- c("exrelefo_yes", "ahown_yes", "hocenh_yes", "hoadpwd_yes", "hoadprs_yes", "hoadphr_yes", "hoadpad_yes", "hoadpap_yes", "hoadpbm_yes", "hoadpkm_yes", "hoadpli_yes", "hoadpcl_yes", "hoadpal_yes", "hoprosp_yes", "hopronz_yes", "hoprosn_yes", "hoprodk_yes", "hopropo_yes", "hoprord_yes", "hoprowa_yes", "hoprocp_yes", "hoproep_yes", "hoproro_yes", "hoproin_yes", "hoproco_yes")
+socc <- c(
+  "mstat_widowed", "mstat_separated", "mstat_never", "hhres",
+  "cchild", "csib", "cfriend", 
+  "chldcontact", "sibcontact", "friendcontact", 
+  "sposupport", "snegsupport", "kposupport", "knegsupport", "oposupport", "onegsupport", "fposupport", "fnegsupport", 
+  "political_yes", "tenant_yes", "church_yes", "charitable_yes", "course_yes", "club_yes", "sport_yes", 
+  "newspaper_yes", "internet_yes", "phone_yes", "holidayuk_yes", "holidayabroad_yes", "daytrip_yes", "hopet_yes",
+  "volunteer", "cinema", "art", "theater", "tvtime",
+  "nnsocial")
+stress <- c(
+  "pdailydiscrim", "loneliness", "nadise_yes", "lifethe_yes", "attacke_yes", "sexas_yes", "addic_yes", "combate_yes", "witwr_yes", "witkl_yes", "loswr_yes", "riskf_yes", "longcare_yes", "sfnhe_yes", "homeless_yes")
+behav <- c("smokev_yes", "smoken_yes", "drink_e", "drinkwn_e", "ltactx_e", "mdactx_e", "vgactx_e", "mbmi", "sleeph", "sleep", "vegetable", "fruit")
+hcare <- c("hipriv_yes", "difftogp_yes", "difftodentist_yes", "difftooptician_yes", "difftoshospital_yes", "transportdep_yes")
+
+var_order <- c(demo, ace, ses, mc, socc, stress, behav, hcare)
+
+# var_order[!var_order %in% sv_importance(shp_overall, max_display = 150)$data[,"feature"]]
+
+var_name <- c(
+  "Age",
+  "Sex: male",
+   
+  "Higher father's education", 
+  "Higher mother's education",
+  "Overcrowding (childhood)",
+  "Number of books (childhood)",
+  "Fixed bath (childhood)",
+  "Cold running water supply (childhood)",
+  "Hot running water supply (childhood)",
+  "Indoor toilet (childhood)",
+  "Central heating (childhood)",
+  "Main carer's occupation: intermediate", 
+  "Main carer's occupation: low",
+  "Main carer's occupation: other",
+  "Parents unemployed",
+  "Childhood financial difficulties",
+  
+  "Lower bonding with father",
+  "Lower bonding with mother",
+  "Separated from mother",
+  "Parents died",
+  "Lived in a children's home",
+  "Fostered with another family",
+  "Repeated school",
+  "Physically assaulted",
+  "Sexually abused",
+  "Physically abused by parents",
+  "Parents argued",
+  "Parents used drugs/alcohol or mentally ill",
+  "Parents separated or divorced",
+ 
+  "Higher education",
+  "Household wealth", 
+  "Annual household income",
+  "Higher subjective social status",
+  "Race: white",
+  "Labor force status: other",
+  "Labor force status: retired",
+  
+  "Food unaffordability",
+  "Home ownership",
+  "Central heating",
+  "Widened doorways",
+  "Ramps",
+  "Hand rails",
+  "Automatic doors",
+  "Accessible parking site",
+  "Bathroom modifications",
+  "Kitchen modifications",
+  "Lift",
+  "Chair lift or stair glide",
+  "Alerting devices",
+  "Shortage of space",
+  "Noise from neighbors",
+  "Other street noise",
+  "Too dark",
+  "Environmental problems",
+  "Rising damp",
+  "Water leaking in",
+  "Bad condensation problems",
+  "Problems with electrical wiring or plumbing",
+  "Rot and decay",
+  "Problems with insects, mice or rats",
+  "Too cold in winter",
+  
+  "Marital status: widowed", 
+  "Marital status: separated/divorced", 
+  "Marital status: never married",
+  "Household size",
+  "Number of close children",
+  "Number of f close family members", 
+  "Number of close friends",
+  "Contact with children",
+  "Contact with other family members", 
+  "Contact with friends", 
+  "Support from spouse", 
+  "Strain from spouse",
+  "Support from children", 
+  "Strain from children", 
+  "Support from other family members", 
+  "Strain from other family members", 
+  "Support from friends",
+  "Strain from friends",
+  "Member of political organizations",
+  "Member of community organizations",
+  "Member of religious groups",
+  "Member of charitable associations",
+  "Attend educational courses",
+  "Participate in a social club",
+  "Go to sport clubs",
+  "Read newspapers",
+  "Use the internet/email",
+  "Own a mobile phone",
+  "Take a holiday in the UK",
+  "Take a holiday abroad",
+  "Go on a daytrip",
+  "Pet ownership",
+  "Do volunteer work",
+  "Go to the cinema",
+  "Go to an art gallery/museum",
+  "Attend theater/concert/opera",
+  "Watch television",
+  "Neighborhood social cohesion", 
+
+  "Daily discrimination", 
+  "Loneliness",
+  "Experienced a natural disaster",
+  "Ever had a life-threatening illness",
+  "Been a victim of a physical attack",
+  "Been a victim of a sexual assault",
+  "Family members addicted to drugs/alcohol", 
+  "Fired a weapon in combat",
+  "Witnessed the injury/death in war",
+  "Witnessed the accident/violent act",
+  "Lost a close friend/relative in war",
+  "Close friend/relative died",
+  "Provided long-term care",
+  "Experienced severe financial hardship",
+  "Ever been homeless",
+  
+  "Ever smoking", 
+  "Currently smoking", 
+  "Higher drinking frequency",
+  "Total number of drinks per week", 
+  "Light physical activities", 
+  "Moderate physical activities", 
+  "Vigorous physical activities",
+  "Body mass index",
+  "Sleep duration",
+  "Sleep problems",
+  "Vegetables consumption",
+  "Fruit consumption",
+
+  "Private health insurance",
+  "Poor access to general practitioner",
+  "Poor access to the dentist",
+  "Poor access to optician",
+  "Poor access to hospital",
+  "Transport deprivation"
+  )
+
+# SHAP values
+shp_imp_var_65plus <- sv_importance(shp_65plus, max_display = 150)$data %>%
+  as_tibble() %>%
+  mutate(
+    value_normalized = value / sum(value),
+    category = case_when(
+      feature %in% demo ~ "Demographics",
+      feature %in% ace ~ "Adverse Childhood Experiences",
+      feature %in% ses ~ "Socioeconomic Status",
+      feature %in% mc ~ "Material Circumstances",
+      feature %in% socc ~ "Social Connections",
+      feature %in% stress ~ "Social Stressors",
+      feature %in% behav ~ "Health Behaviors",
+      feature %in% hcare ~ "Healthcare Systems"
+    ),
+    category = factor(category, levels = c("Demographics", "Adverse Childhood Experiences", "Socioeconomic Status", "Material Circumstances", "Social Connections", "Social Stressors", "Health Behaviors", "Healthcare Systems")),
+    feature = factor(feature, levels = var_order)
+  ) %>%
+  arrange(category, feature) %>%
+  mutate(var_name = var_name) %>%
+  arrange(value)
+shp_imp_var_65plus$var_name <- factor(shp_imp_var_65plus$var_name, levels = shp_imp_var_65plus$var_name)
+
+shp_imp_cate_65plus <- shp_imp_var_65plus %>%
+  dplyr::select(value_normalized, category) %>%
+  group_by(category) %>%
+  summarise(value_normalized = sum(value_normalized)) %>%
+  arrange(category) %>%
+  arrange(value_normalized)
+
+# Dependence plot
+S <- shp_65plus[["S"]] %>% # Matrix of SHAP values
+  as_tibble() %>%
+  dplyr::select(all_of(var_order)) %>%
+  data.matrix()
+colnames(S) <- var_name
+
+X <- shp_65plus[["X"]] %>% # Dataset that includes the corresponding feature values
+  dplyr::select(all_of(var_order))
+colnames(X) <- var_name
+
+shp_65plus_named <- shp_65plus
+shp_65plus_named$S <- S
+shp_65plus_named$X <- X
+
+sv_imp_65plus <- sv_importance(shp_65plus_named, max_display = 150)
+
+```
+
+# Plot
+
+## Save plotting data
+
+```{r}
+
+final_elsa <- final
+
+mae_cv_overall_elsa <- mae_cv_overall
+rmse_cv_overall_elsa <- rmse_cv_overall
+rsq_cv_overall_elsa <- rsq_cv_overall
+mae_boot_xgb_overall_elsa <- mae_boot_xgb_overall
+rmse_boot_xgb_overall_elsa <- rmse_boot_xgb_overall
+rsq_boot_xgb_overall_elsa <- rsq_boot_xgb_overall
+shp_overall_elsa <- shp_overall
+shp_imp_var_overall_elsa <- shp_imp_var_overall
+shp_imp_cate_overall_elsa <- shp_imp_cate_overall
+sv_imp_overall_elsa <- sv_imp_overall
+train_results_elsa <- train_results
+test_results_elsa <- test_results
+combined_results_elsa <- combined_results
+
+mae_cv_male_elsa <- mae_cv_male
+rmse_cv_male_elsa <- rmse_cv_male
+rsq_cv_male_elsa <- rsq_cv_male
+mae_boot_xgb_male_elsa <- mae_boot_xgb_male
+rmse_boot_xgb_male_elsa <- rmse_boot_xgb_male
+rsq_boot_xgb_male_elsa <- rsq_boot_xgb_male
+shp_male_elsa <- shp_male
+shp_imp_var_male_elsa <- shp_imp_var_male
+shp_imp_cate_male_elsa <- shp_imp_cate_male
+sv_imp_male_elsa <- sv_imp_male
+
+mae_cv_female_elsa <- mae_cv_female
+rmse_cv_female_elsa <- rmse_cv_female
+rsq_cv_female_elsa <- rsq_cv_female
+mae_boot_xgb_female_elsa <- mae_boot_xgb_female
+rmse_boot_xgb_female_elsa <- rmse_boot_xgb_female
+rsq_boot_xgb_female_elsa <- rsq_boot_xgb_female
+shp_female_elsa <- shp_female
+shp_imp_var_female_elsa <- shp_imp_var_female
+shp_imp_cate_female_elsa <- shp_imp_cate_female
+sv_imp_female_elsa <- sv_imp_female
+
+mae_cv_5064_elsa <- mae_cv_5064
+rmse_cv_5064_elsa <- rmse_cv_5064
+rsq_cv_5064_elsa <- rsq_cv_5064
+mae_boot_xgb_5064_elsa <- mae_boot_xgb_5064
+rmse_boot_xgb_5064_elsa <- rmse_boot_xgb_5064
+rsq_boot_xgb_5064_elsa <- rsq_boot_xgb_5064
+shp_5064_elsa <- shp_5064
+shp_imp_var_5064_elsa <- shp_imp_var_5064
+shp_imp_cate_5064_elsa <- shp_imp_cate_5064
+sv_imp_5064_elsa <- sv_imp_5064
+
+mae_cv_65plus_elsa <- mae_cv_65plus
+rmse_cv_65plus_elsa <- rmse_cv_65plus
+rsq_cv_65plus_elsa <- rsq_cv_65plus
+mae_boot_xgb_65plus_elsa <- mae_boot_xgb_65plus
+rmse_boot_xgb_65plus_elsa <- rmse_boot_xgb_65plus
+rsq_boot_xgb_65plus_elsa <- rsq_boot_xgb_65plus
+shp_65plus_elsa <- shp_65plus
+shp_imp_var_65plus_elsa <- shp_imp_var_65plus
+shp_imp_cate_65plus_elsa <- shp_imp_cate_65plus
+sv_imp_65plus_elsa <- sv_imp_65plus
+
+save(
+  final_elsa, opt_hyper_elsa,
+  mae_cv_overall_elsa, rmse_cv_overall_elsa, rsq_cv_overall_elsa, 
+  mae_boot_xgb_overall_elsa, rmse_boot_xgb_overall_elsa, rsq_boot_xgb_overall_elsa, 
+  shp_overall_elsa, shp_imp_var_overall_elsa, shp_imp_cate_overall_elsa, sv_imp_overall_elsa,
+  train_results_elsa, test_results_elsa, combined_results_elsa,
+  
+  mae_cv_male_elsa, rmse_cv_male_elsa, rsq_cv_male_elsa, 
+  mae_boot_xgb_male_elsa, rmse_boot_xgb_male_elsa, rsq_boot_xgb_male_elsa,
+  shp_male_elsa, shp_imp_var_male_elsa, shp_imp_cate_male_elsa, sv_imp_male_elsa, 
+  
+  mae_cv_female_elsa, rmse_cv_female_elsa, rsq_cv_female_elsa, 
+  mae_boot_xgb_female_elsa, rmse_boot_xgb_female_elsa, rsq_boot_xgb_female_elsa,
+  shp_female_elsa, shp_imp_var_female_elsa, shp_imp_cate_female_elsa, sv_imp_female_elsa, 
+  
+  mae_cv_5064_elsa, rmse_cv_5064_elsa, rsq_cv_5064_elsa, 
+  mae_boot_xgb_5064_elsa, rmse_boot_xgb_5064_elsa, rsq_boot_xgb_5064_elsa,
+  shp_5064_elsa, shp_imp_var_5064_elsa, shp_imp_cate_5064_elsa, sv_imp_5064_elsa,
+  
+  mae_cv_65plus_elsa, rmse_cv_65plus_elsa, rsq_cv_65plus_elsa, 
+  mae_boot_xgb_65plus_elsa, rmse_boot_xgb_65plus_elsa, rsq_boot_xgb_65plus_elsa,
+  shp_65plus_elsa, shp_imp_var_65plus_elsa, shp_imp_cate_65plus_elsa, sv_imp_65plus_elsa, 
+
+  heatmap_mat_elsa, 
+  file = str_c(getwd(), "/data/processed/elsa_processed_data_for_visualization.RData", sep = ""))
+
+```
+
