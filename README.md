@@ -4,9 +4,11 @@ This is the code repository for the paper "Cross-national analysis of social det
 
 ## Directory
 ### code
-- **0_package_installation**: installation essential software packages required for the project.
-- **1_data_analyzing**: R Markdown files (*.Rmd) for data processing.
-- **2_visualization**: R Markdown files (*.Rmd) for data analysis and visualization. Specifically, **analysis.Rmd** requires the processed data in the **processed** file.
+- **0_package_installation**: For installing and configuring required packages and dependencies for the project.
+- **1_analysis**: Main folder for data analysis, containing different modeling approaches.
+  - **ga2m**: Contains data modeling based on GA2M method, with 3 Jupyter notebook files (*.ipynb) for CHARLS, ELSA, and HRS datasets.
+  - **xgboost**: Contains data modeling using XGBoost algorithm, with R Markdown files (*.Rmd) for CHARLS, ELSA, and HRS datasets.
+- **2_visualization**: For data visualization files and scripts that display analysis results graphically.
 
 ### data
 - **raw**: original data files obtained from the [offical website](data\raw\README.md) of each cohort.
@@ -16,28 +18,29 @@ This is the code repository for the paper "Cross-national analysis of social det
 All codes were originally processed using:
 
 - System hardware:
-  - R version 4.3.3 (2024-02-29 ucrt)
+  - R version 4.1.1 (2021-08-10)
   - Platform: x86_64-w64-mingw32/x64 (64-bit)
   - Running under: Windows 10 x64 (build 19045)
 &nbsp;
 - Software:
-  
+
 | name_version | name_version | name_version |
 |---------|---------|---------|
-| broom.mixed_0.2.9.5    | data.table_1.15.4   | doParallel_1.0.17     |
-| dplyr_1.1.4            | foreach_1.5.2       | forcats_1.0.0         |
-| geepack_1.3.11         | gfoRmula_1.0.4      | ggplot2_3.5.1         |
-| ggpubr_0.6.0           | ggsci_3.2.0         | ggtext_0.1.2          |
-| glue_1.7.0             | gt_0.11.0           | gtsummary_1.7.2       |
-| haven_2.5.4            | iterators_1.0.14    | lme4_1.1-35.5         |
-| lmerTest_3.1-3         | lubridate_1.9.3     | marginaleffects_0.21.0|
-| Matrix_1.6-5           | metadat_1.2-0       | metafor_4.6-0         |
-| mice_3.16.0            | miceadds_3.17-44    | modelsummary_2.1.1    |
-| numDeriv_2016.8-1.1    | patchwork_1.2.0     | purrr_1.0.2           |
-| readr_2.1.5            | readxl_1.4.3        | sjlabelled_1.2.0      |
-| skimr_2.1.5            | stringr_1.5.1       | survival_3.7-0        |
-| tibble_3.2.1           | tictoc_1.2.1        | tidyr_1.3.1           |
-| tidyverse_2.0.0        |                     |                       |
+| broom_1.0.5 | dials_1.2.1 | doParallel_1.0.17 |
+| dplyr_1.1.4 | forcats_1.0.0 | foreach_1.5.2 |
+| ggplot2_3.5.0 | ggpubr_0.6.0 | ggrepel_0.9.5 |
+| ggtext_0.1.2 | gridExtra_2.3 | gtsummary_1.7.2 |
+| haven_2.5.4 | infer_1.0.6 | iterators_1.0.14 |
+| lubridate_1.9.3 | missRanger_2.4.0 | modeldata_1.3.0 |
+| parsnip_1.2.0 | patchwork_1.2.0 | purrr_1.0.1 |
+| readr_2.1.5 | recipes_1.0.10 | reshape2_1.4.4 |
+| rsample_1.2.0 | scales_1.3.0 | shapviz_0.9.3 |
+| sjlabelled_1.2.0 | skimr_2.1.5 | stringr_1.5.1 |
+| tibble_3.2.1 | tictoc_1.2 | tidymodels_1.0.0 |
+| tidyr_1.3.0 | tidyverse_2.0.0 | tune_1.1.2 |
+| utile.visuals_0.3.3 | VIM_6.2.2 | viridisLite_0.4.2 |
+| workflows_1.1.4 | workflowsets_1.0.1 | yardstick_1.3.0 |
+| boot_1.3-30 |  |  |
 
 ## License
 This project is available under the MIT license.
