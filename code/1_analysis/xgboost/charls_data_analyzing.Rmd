@@ -1180,7 +1180,7 @@ tidy_fi_baseline_imp <- missRanger(tidy_fi_baseline, . ~ . - id - wave, pmm.k = 
     depresl = (depresl-1)/3, effortl = (effortl-1)/3, whappyl = (whappyl-1)/3, botherl = (botherl-1)/3, 
     mindtsl = (mindtsl-1)/3, fhopel = (fhopel-1)/3, fearll = (fearll-1)/3, goingl = (goingl-1)/3, # 8
     cognition = 1 - sum(c(imrc, dlrc, orient, ser7, draw), na.rm = T)/30, # 1
-    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, depresl, effortl, whappyl, botherl, mindtsl, fhopel, fearll, goingl, cognition), na.rm = F)/55
+    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, depresl, effortl, whappyl, botherl, mindtsl, fhopel, fearll, goingl, cognition), na.rm = F)/47
   ) %>%
   ungroup() %>%
   dplyr::select(c(id, wave), !c(id, wave))
@@ -1261,7 +1261,7 @@ tidy_fi_follow_imp <- missRanger(tidy_fi_follow, . ~ . - id - wave, pmm.k = 5, m
     depresl = (depresl-1)/3, effortl = (effortl-1)/3, whappyl = (whappyl-1)/3, botherl = (botherl-1)/3, 
     mindtsl = (mindtsl-1)/3, fhopel = (fhopel-1)/3, fearll = (fearll-1)/3, goingl = (goingl-1)/3, # 8
     cognition = 1 - sum(c(imrc, dlrc, orient, ser7, draw), na.rm = T)/30, # 1
-    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, depresl, effortl, whappyl, botherl, mindtsl, fhopel, fearll, goingl, cognition), na.rm = F)/55
+    fi = sum(c(disease, adl, iadl, moblimit, prshlt, dvi, nvi, hi, depresl, effortl, whappyl, botherl, mindtsl, fhopel, fearll, goingl, cognition), na.rm = F)/47
   ) %>%
   ungroup() %>%
   dplyr::select(c(id, wave), !c(id, wave))
