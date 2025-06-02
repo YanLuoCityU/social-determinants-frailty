@@ -1,6 +1,6 @@
 # Cross-national analysis of social determinants of frailty among middle-aged and older adults in the USA, England, and China
 
-This is the code repository for the paper "Cross-national analysis of social determinants of frailty among middle-aged and older adults in the USA, England, and China". It contains directories for code and data.
+This is the code repository for the paper "[Cross-national analysis of social determinants of frailty among middle-aged and older adults in the USA, England, and China](https://www.nature.com/articles/s41599-025-05088-0)". It contains directories for code and data.
 
 ## Directory
 ### code
